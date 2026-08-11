@@ -1,24 +1,28 @@
 """Approval-gated, failure-atomic application of precomputed sync plans.
 
-On platforms exposing directory-relative ``os.replace``/``os.unlink``, each
-replacement is anchored to an already-open parent directory descriptor.  The
-portable fallback verifies every parent directory's identity immediately
-before and after pathname operations.  No portable userspace technique can
-eliminate a malicious kernel-level race inside one fallback system call; a
-detected late swap is treated as an apply failure and rollback is attempted.
+Replacement is anchored to an already-open parent directory descriptor when
+the platform supports it. Cleanup first moves an entry with a platform-native
+atomic no-replace operation. Windows then deletes the verified file by handle.
+POSIX reopens and revalidates the directory entry after hashing, rechecks it
+immediately before an anchored unlink, and documents the irreducible same-UID
+race between those two syscalls as outside the V1 threat model.
 """
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
+import importlib
 import os
+import platform
 import secrets
 import stat
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
+from typing import Any, BinaryIO, cast
 
 from skillcord.sync.planner import PlannedFileChange, SyncPlan, resolve_target_within_root
 
@@ -126,24 +130,6 @@ class _ParentGuard:
                 expected.file_type,
             ):
                 raise StaleSyncPlanError(f"parent directory changed: {self.parent}")
-
-    def unlink_staged(self, target: Path, *, missing_ok: bool) -> None:
-        """Remove a staged name through its retained trusted directory handle."""
-
-        if self.descriptor is None:
-            self.verify()
-            try:
-                target.unlink()
-            except FileNotFoundError:
-                if not missing_ok:
-                    raise
-            self.verify()
-            return
-        try:
-            os.unlink(target.name, dir_fd=self.descriptor)
-        except FileNotFoundError:
-            if not missing_ok:
-                raise
 
     def close(self) -> None:
         if self.descriptor is not None:
@@ -582,24 +568,62 @@ def _observe_file(
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             raise StaleSyncPlanError(f"staged file changed: {path}")
-        if path_metadata is not None and _FileIdentity.from_stat(path_metadata) != (
-            _FileIdentity.from_stat(metadata)
-        ):
+        opened_values = _metadata_values(metadata)
+        if path_metadata is not None and _metadata_values(path_metadata) != opened_values:
             raise StaleSyncPlanError(f"staged file changed: {path}")
         with os.fdopen(descriptor, "rb") as stream:
             descriptor = -1
             content_hash = hashlib.sha256(stream.read()).digest()
+            if _metadata_values(os.fstat(stream.fileno())) != opened_values:
+                raise StaleSyncPlanError(f"staged file changed: {path}")
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+    if _reopen_entry_metadata(guard, path) != opened_values:
+        raise StaleSyncPlanError(f"staged file changed: {path}")
     if not trusted:
         guard.verify()
+    return (
+        opened_values[0],
+        opened_values[1],
+        opened_values[2],
+        content_hash,
+    )
+
+
+def _metadata_values(metadata: os.stat_result) -> tuple[_FileIdentity, int, int]:
     return (
         _FileIdentity.from_stat(metadata),
         metadata.st_size,
         stat.S_IMODE(metadata.st_mode),
-        content_hash,
     )
+
+
+def _reopen_entry_metadata(
+    guard: _ParentGuard,
+    path: Path,
+) -> tuple[_FileIdentity, int, int]:
+    """Re-open the directory entry no-follow after hashing and revalidate it."""
+
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    path_metadata: os.stat_result | None = None
+    if guard.descriptor is not None:
+        descriptor = os.open(path.name, flags, dir_fd=guard.descriptor)
+    else:
+        path_metadata = path.lstat()
+        if stat.S_ISLNK(path_metadata.st_mode):
+            raise StaleSyncPlanError(f"staged file changed: {path}")
+        descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        values = _metadata_values(metadata)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise StaleSyncPlanError(f"staged file changed: {path}")
+        if path_metadata is not None and _metadata_values(path_metadata) != values:
+            raise StaleSyncPlanError(f"staged file changed: {path}")
+        return values
+    finally:
+        os.close(descriptor)
 
 
 def _verify_entry_at(
@@ -659,39 +683,6 @@ def _same_entry(left: _StagedEntry | None, right: _StagedEntry | None) -> bool:
     )
 
 
-def _quarantine_name_available(
-    guard: _ParentGuard,
-    path: Path,
-    *,
-    trusted: bool,
-) -> bool:
-    if not trusted:
-        guard.verify()
-    if guard.descriptor is not None:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(path.name, flags, dir_fd=guard.descriptor)
-        except FileNotFoundError:
-            available = True
-        except OSError:
-            available = False
-        else:
-            os.close(descriptor)
-            available = False
-    else:
-        try:
-            path.lstat()
-        except FileNotFoundError:
-            available = True
-        except OSError:
-            available = False
-        else:
-            available = False
-    if not trusted:
-        guard.verify()
-    return available
-
-
 def _rename_to_quarantine(
     guard: _ParentGuard,
     source: Path,
@@ -699,19 +690,366 @@ def _rename_to_quarantine(
     *,
     trusted: bool,
 ) -> None:
-    if guard.descriptor is not None:
-        os.rename(
-            source.name,
-            quarantine.name,
-            src_dir_fd=guard.descriptor,
-            dst_dir_fd=guard.descriptor,
+    if not trusted:
+        guard.verify()
+    try:
+        _atomic_rename_noreplace(guard, source, quarantine)
+    except OSError as error:
+        unsupported = {
+            errno.EINVAL,
+            errno.ENOSYS,
+            errno.ENOTSUP,
+            getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+        }
+        if error.errno in unsupported:
+            raise StaleSyncPlanError(
+                "atomic no-replace rename unavailable; preserved source entry: "
+                f"{source}"
+            ) from error
+        raise
+    if not trusted:
+        guard.verify()
+
+
+def _atomic_rename_noreplace(
+    guard: _ParentGuard,
+    source: Path,
+    destination: Path,
+) -> None:
+    """Rename one entry without ever replacing an existing destination."""
+
+    if os.name == "nt":
+        if guard.descriptor is not None:
+            os.rename(
+                source.name,
+                destination.name,
+                src_dir_fd=guard.descriptor,
+                dst_dir_fd=guard.descriptor,
+            )
+        else:
+            os.rename(source, destination)
+        return
+    if platform.system() == "Linux":
+        _linux_rename_noreplace(guard, source, destination)
+        return
+    if platform.system() == "Darwin":
+        _macos_rename_noreplace(guard, source, destination)
+        return
+    raise StaleSyncPlanError(
+        "atomic no-replace rename unavailable; preserved source entry: " f"{source}"
+    )
+
+
+def _linux_rename_noreplace(
+    guard: _ParentGuard,
+    source: Path,
+    destination: Path,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    old_dir_fd, old_name, new_dir_fd, new_name = _renameat_arguments(
+        guard,
+        source,
+        destination,
+        at_fdcwd=-100,
+    )
+    renameat2: Any | None = getattr(libc, "renameat2", None)
+    ctypes.set_errno(0)
+    if renameat2 is not None:
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(old_dir_fd, old_name, new_dir_fd, new_name, 1)
+    else:
+        syscall_number = _linux_renameat2_syscall_number()
+        syscall: Any | None = getattr(libc, "syscall", None)
+        if syscall_number is None or syscall is None:
+            raise StaleSyncPlanError(
+                "atomic no-replace rename unavailable; preserved source entry: "
+                f"{source}"
+            )
+        syscall.restype = ctypes.c_long
+        result = syscall(
+            ctypes.c_long(syscall_number),
+            ctypes.c_int(old_dir_fd),
+            ctypes.c_char_p(old_name),
+            ctypes.c_int(new_dir_fd),
+            ctypes.c_char_p(new_name),
+            ctypes.c_uint(1),
         )
+    if result != 0:
+        _raise_posix_rename_error(source, destination)
+
+
+def _linux_renameat2_syscall_number() -> int | None:
+    machine = platform.machine().lower()
+    return {
+        "aarch64": 276,
+        "arm64": 276,
+        "x86_64": 316,
+    }.get(machine)
+
+
+def _macos_rename_noreplace(
+    guard: _ParentGuard,
+    source: Path,
+    destination: Path,
+) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename_exclusive = 0x00000004
+    ctypes.set_errno(0)
+    if guard.descriptor is not None:
+        renameatx_np: Any | None = getattr(libc, "renameatx_np", None)
+        if renameatx_np is None:
+            raise StaleSyncPlanError(
+                "atomic directory-relative no-replace rename unavailable; "
+                f"preserved source entry: {source}"
+            )
+        renameatx_np.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameatx_np.restype = ctypes.c_int
+        result = renameatx_np(
+            guard.descriptor,
+            os.fsencode(source.name),
+            guard.descriptor,
+            os.fsencode(destination.name),
+            rename_exclusive,
+        )
+    else:
+        renamex_np: Any | None = getattr(libc, "renamex_np", None)
+        if renamex_np is None:
+            raise StaleSyncPlanError(
+                "atomic no-replace rename unavailable; preserved source entry: "
+                f"{source}"
+            )
+        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(
+            os.fsencode(source),
+            os.fsencode(destination),
+            rename_exclusive,
+        )
+    if result != 0:
+        _raise_posix_rename_error(source, destination)
+
+
+def _renameat_arguments(
+    guard: _ParentGuard,
+    source: Path,
+    destination: Path,
+    *,
+    at_fdcwd: int,
+) -> tuple[int, bytes, int, bytes]:
+    if guard.descriptor is not None:
+        return (
+            guard.descriptor,
+            os.fsencode(source.name),
+            guard.descriptor,
+            os.fsencode(destination.name),
+        )
+    return (
+        at_fdcwd,
+        os.fsencode(source),
+        at_fdcwd,
+        os.fsencode(destination),
+    )
+
+
+def _raise_posix_rename_error(source: Path, destination: Path) -> None:
+    error_number = ctypes.get_errno() or errno.EIO
+    raise OSError(
+        error_number,
+        os.strerror(error_number),
+        os.fspath(source),
+        None,
+        os.fspath(destination),
+    )
+
+
+class _WindowsFileDispositionInfo(ctypes.Structure):
+    _fields_ = [("DeleteFile", ctypes.c_ubyte)]
+
+
+def _delete_verified_quarantine(
+    guard: _ParentGuard,
+    path: Path,
+    expected: _StagedEntry,
+    *,
+    trusted: bool,
+    label: str,
+) -> None:
+    if os.name == "nt":
+        _windows_delete_verified_quarantine(
+            guard,
+            path,
+            expected,
+            trusted=trusted,
+            label=label,
+        )
+        return
+    if os.name != "posix":
+        raise StaleSyncPlanError(
+            "safe quarantine deletion unavailable; preserved verified quarantine: " f"{path}"
+        )
+
+    # POSIX has no inode-compare unlink primitive. Re-observe the name after
+    # the first quarantine verification and make unlink the immediately next
+    # namespace operation. A malicious same-UID writer can still race inside
+    # that final syscall boundary; V1 does not claim protection from one.
+    _verify_entry_at(
+        guard,
+        path,
+        expected,
+        trusted=trusted,
+        label=label,
+    )
+    if guard.descriptor is not None:
+        os.unlink(path.name, dir_fd=guard.descriptor)
         return
     if not trusted:
         guard.verify()
-    os.rename(source, quarantine)
+    path.unlink()
     if not trusted:
         guard.verify()
+
+
+def _windows_delete_verified_quarantine(
+    guard: _ParentGuard,
+    path: Path,
+    expected: _StagedEntry,
+    *,
+    trusted: bool,
+    label: str,
+) -> None:
+    """Exclusively open, verify, and delete the exact Windows file by handle."""
+
+    if not trusted:
+        guard.verify()
+    loader: Any | None = getattr(ctypes, "WinDLL", None)
+    if loader is None:
+        raise StaleSyncPlanError(
+            "atomic compare-delete unavailable; preserved verified quarantine: " f"{path}"
+        )
+    kernel32: Any = loader("kernel32", use_last_error=True)
+    create_file: Any = kernel32.CreateFileW
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    create_file.restype = ctypes.c_void_p
+    close_handle: Any = kernel32.CloseHandle
+    close_handle.argtypes = [ctypes.c_void_p]
+    close_handle.restype = ctypes.c_int
+    set_information: Any = kernel32.SetFileInformationByHandle
+    set_information.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    set_information.restype = ctypes.c_int
+
+    generic_read = 0x80000000
+    delete_access = 0x00010000
+    open_existing = 3
+    file_attribute_normal = 0x00000080
+    file_flag_open_reparse_point = 0x00200000
+    handle = create_file(
+        os.fspath(path),
+        generic_read | delete_access,
+        0,
+        None,
+        open_existing,
+        file_attribute_normal | file_flag_open_reparse_point,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle in (None, invalid_handle):
+        raise _windows_error(path)
+
+    raw_handle_owned = True
+    descriptor = -1
+    try:
+        msvcrt = importlib.import_module("msvcrt")
+        open_osfhandle = cast(Callable[[int, int], int], msvcrt.open_osfhandle)
+        descriptor = open_osfhandle(
+            cast(int, handle),
+            os.O_RDONLY | getattr(os, "O_BINARY", 0),
+        )
+        raw_handle_owned = False
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            metadata = os.fstat(stream.fileno())
+            opened_values = _metadata_values(metadata)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise StaleSyncPlanError(f"{label}: {path}")
+            path_metadata = path.lstat()
+            if stat.S_ISLNK(path_metadata.st_mode):
+                raise StaleSyncPlanError(f"{label}: {path}")
+            if _metadata_values(path_metadata) != opened_values:
+                raise StaleSyncPlanError(f"{label}: {path}")
+            content_hash = hashlib.sha256(stream.read()).digest()
+            if _metadata_values(os.fstat(stream.fileno())) != opened_values:
+                raise StaleSyncPlanError(f"{label}: {path}")
+            if _metadata_values(path.lstat()) != opened_values:
+                raise StaleSyncPlanError(f"{label}: {path}")
+            observed = (*opened_values, content_hash)
+            expected_values = (
+                expected.identity,
+                expected.size,
+                expected.mode,
+                expected.content_hash,
+            )
+            if observed != expected_values:
+                raise StaleSyncPlanError(f"{label}: {path}")
+            if not trusted:
+                guard.verify()
+            disposition = _WindowsFileDispositionInfo(1)
+            if not set_information(
+                handle,
+                4,
+                ctypes.byref(disposition),
+                ctypes.sizeof(disposition),
+            ):
+                raise _windows_error(path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if raw_handle_owned:
+            close_handle(handle)
+
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise StaleSyncPlanError(f"{label}: replacement appeared after deletion: {path}")
+    if not trusted:
+        guard.verify()
+
+
+def _windows_error(path: Path) -> OSError:
+    error_number = ctypes.get_last_error()
+    message = ctypes.FormatError(error_number)
+    if error_number in {2, 3}:
+        return FileNotFoundError(error_number, message, os.fspath(path))
+    if error_number == 5:
+        return PermissionError(error_number, message, os.fspath(path))
+    return OSError(error_number, message, os.fspath(path))
 
 
 def _quarantine_and_delete(
@@ -726,8 +1064,6 @@ def _quarantine_and_delete(
         quarantine = guard.parent / (
             f".{path.name}.{secrets.token_hex(8)}.skillcord.quarantine"
         )
-        if not _quarantine_name_available(guard, quarantine, trusted=trusted):
-            continue
         try:
             _rename_to_quarantine(
                 guard,
@@ -744,7 +1080,13 @@ def _quarantine_and_delete(
             trusted=trusted,
             label=label,
         )
-        guard.unlink_staged(quarantine, missing_ok=False)
+        _delete_verified_quarantine(
+            guard,
+            quarantine,
+            expected,
+            trusted=trusted,
+            label=label,
+        )
         return
     raise FileExistsError(f"could not allocate a quarantine name for: {path}")
 

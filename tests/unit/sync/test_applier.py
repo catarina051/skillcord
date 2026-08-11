@@ -3,6 +3,7 @@ import os
 import stat
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -44,6 +45,18 @@ class _MultiFileAdapter:
                 ("c-fail.txt", b"new c\n"),
             )
         ]
+
+
+class _FakeCFunction:
+    def __init__(self, result: int = 0) -> None:
+        self.result = result
+        self.calls: list[tuple[object, ...]] = []
+        self.argtypes: object = None
+        self.restype: object = None
+
+    def __call__(self, *args: object) -> int:
+        self.calls.append(args)
+        return self.result
 
 
 def _plan(tmp_path: Path, *, parent_exists: bool = True):
@@ -780,7 +793,7 @@ def test_fallback_cleanup_quarantines_substitution_instead_of_deleting_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan = _plan(tmp_path)
-    real_rename = os.rename
+    real_rename_noreplace = applier_module._atomic_rename_noreplace
     attacker_bytes = b"cleanup substitute\n"
     substitution_happened = False
 
@@ -788,22 +801,24 @@ def test_fallback_cleanup_quarantines_substitution_instead_of_deleting_it(
         raise OSError("injected post-stage failure")
 
     def substitute_before_quarantine(
-        source: object,
-        destination: object,
-        *args: object,
-        **kwargs: object,
+        guarded: applier_module._ParentGuard,
+        source: Path,
+        destination: Path,
     ) -> None:
         nonlocal substitution_happened
-        source_path = Path(os.fspath(source))
-        if source_path.name.endswith(".skillcord.tmp"):
-            source_path.unlink()
-            source_path.write_bytes(attacker_bytes)
+        if source.name.endswith(".skillcord.tmp"):
+            source.unlink()
+            source.write_bytes(attacker_bytes)
             substitution_happened = True
-        real_rename(source, destination, *args, **kwargs)
+        real_rename_noreplace(guarded, source, destination)
 
     monkeypatch.setattr(applier_module, "_directory_relative_operations_supported", lambda: False)
     monkeypatch.setattr(SyncApplier, "_after_stage", staticmethod(fail_after_stage))
-    monkeypatch.setattr(os, "rename", substitute_before_quarantine)
+    monkeypatch.setattr(
+        applier_module,
+        "_atomic_rename_noreplace",
+        substitute_before_quarantine,
+    )
 
     with pytest.raises(OSError, match="injected post-stage failure") as raised:
         SyncApplier().apply(plan, approved=True)
@@ -828,7 +843,7 @@ def test_fallback_new_target_rollback_quarantines_substitution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan = _multi_plan(tmp_path)
-    real_rename = os.rename
+    real_rename_noreplace = applier_module._atomic_rename_noreplace
     attacker_bytes = b"rollback substitute\n"
     substitution_happened = False
 
@@ -837,22 +852,24 @@ def test_fallback_new_target_rollback_quarantines_substitution(
             target.write_bytes(b"concurrent change\n")
 
     def substitute_new_target_before_quarantine(
-        source: object,
-        destination: object,
-        *args: object,
-        **kwargs: object,
+        guarded: applier_module._ParentGuard,
+        source: Path,
+        destination: Path,
     ) -> None:
         nonlocal substitution_happened
-        source_path = Path(os.fspath(source))
-        if source_path == tmp_path / "b-new.txt":
-            source_path.unlink()
-            source_path.write_bytes(attacker_bytes)
+        if source == tmp_path / "b-new.txt":
+            source.unlink()
+            source.write_bytes(attacker_bytes)
             substitution_happened = True
-        real_rename(source, destination, *args, **kwargs)
+        real_rename_noreplace(guarded, source, destination)
 
     monkeypatch.setattr(applier_module, "_directory_relative_operations_supported", lambda: False)
     monkeypatch.setattr(SyncApplier, "_before_replace", staticmethod(stale_last_target))
-    monkeypatch.setattr(os, "rename", substitute_new_target_before_quarantine)
+    monkeypatch.setattr(
+        applier_module,
+        "_atomic_rename_noreplace",
+        substitute_new_target_before_quarantine,
+    )
 
     with pytest.raises(SyncRollbackError) as raised:
         SyncApplier().apply(plan, approved=True)
@@ -879,36 +896,492 @@ def test_fallback_quarantine_retries_raced_destination_without_overwrite(
     entry = _staged_entry(temporary)
     monkeypatch.setattr(applier_module, "_directory_relative_operations_supported", lambda: False)
     guard = applier_module._ParentGuard.open(tmp_path, tmp_path)
-    real_rename = os.rename
+    real_rename_noreplace = applier_module._atomic_rename_noreplace
     raced_destination: Path | None = None
     rename_attempts = 0
     tokens = iter(("raced", "fresh"))
 
     def race_first_destination(
-        source: object,
-        destination: object,
-        *args: object,
-        **kwargs: object,
+        guarded: applier_module._ParentGuard,
+        source: Path,
+        destination: Path,
     ) -> None:
         nonlocal raced_destination, rename_attempts
         rename_attempts += 1
         if rename_attempts == 1:
-            raced_destination = Path(os.fspath(destination))
+            raced_destination = destination
             raced_destination.write_bytes(b"unowned collision\n")
-            raise FileExistsError("simulated quarantine-name race")
-        real_rename(source, destination, *args, **kwargs)
+        real_rename_noreplace(guarded, source, destination)
 
     monkeypatch.setattr(applier_module.secrets, "token_hex", lambda _size: next(tokens))
-    monkeypatch.setattr(os, "rename", race_first_destination)
+    monkeypatch.setattr(applier_module, "_atomic_rename_noreplace", race_first_destination)
 
     errors = applier_module._cleanup_entries(guard, [entry])
     guard.close()
 
-    assert errors == []
     assert rename_attempts == 2
     assert raced_destination is not None
     assert raced_destination.read_bytes() == b"unowned collision\n"
     assert not temporary.exists()
+    assert errors == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires real POSIX rename semantics")
+def test_posix_quarantine_move_never_overwrites_real_collision(tmp_path: Path) -> None:
+    source = tmp_path / ".generated.skillcord.tmp"
+    collision = tmp_path / ".generated.collision.skillcord.quarantine"
+    source.write_bytes(b"staged\n")
+    collision.write_bytes(b"unowned collision\n")
+    guard = applier_module._ParentGuard.open(tmp_path, tmp_path)
+
+    try:
+        with pytest.raises(FileExistsError):
+            applier_module._rename_to_quarantine(
+                guard,
+                source,
+                collision,
+                trusted=guard.descriptor is not None,
+            )
+    finally:
+        guard.close()
+
+    assert source.read_bytes() == b"staged\n"
+    assert collision.read_bytes() == b"unowned collision\n"
+
+
+@pytest.mark.parametrize(
+    ("system_name", "helper_name"),
+    (("Linux", "_linux_rename_noreplace"), ("Darwin", "_macos_rename_noreplace")),
+)
+def test_atomic_no_replace_dispatches_only_to_supported_posix_primitive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    system_name: str,
+    helper_name: str,
+) -> None:
+    guard = applier_module._ParentGuard(
+        root=tmp_path,
+        parent=tmp_path,
+        identities=(),
+    )
+    calls: list[tuple[Path, Path]] = []
+
+    def record_call(
+        _guard: applier_module._ParentGuard,
+        source: Path,
+        destination: Path,
+    ) -> None:
+        calls.append((source, destination))
+
+    monkeypatch.setattr(applier_module.os, "name", "posix")
+    monkeypatch.setattr(applier_module.platform, "system", lambda: system_name)
+    monkeypatch.setattr(applier_module, helper_name, record_call)
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+
+    applier_module._atomic_rename_noreplace(guard, source, destination)
+
+    assert calls == [(source, destination)]
+
+
+def test_atomic_no_replace_fails_closed_on_unknown_platform(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.write_bytes(b"owned\n")
+    destination = tmp_path / "destination"
+    guard = applier_module._ParentGuard(
+        root=tmp_path,
+        parent=tmp_path,
+        identities=(),
+    )
+    monkeypatch.setattr(applier_module.os, "name", "posix")
+    monkeypatch.setattr(applier_module.platform, "system", lambda: "unsupported")
+
+    with pytest.raises(StaleSyncPlanError, match="preserved source entry"):
+        applier_module._atomic_rename_noreplace(guard, source, destination)
+
+    assert source.read_bytes() == b"owned\n"
+    assert not destination.exists()
+
+
+def test_linux_renameat2_wrapper_uses_exclusive_dirfd_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    renameat2 = _FakeCFunction()
+    monkeypatch.setattr(
+        applier_module.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: SimpleNamespace(renameat2=renameat2),
+    )
+    guard = applier_module._ParentGuard(
+        root=tmp_path,
+        parent=tmp_path,
+        identities=(),
+        descriptor=456,
+    )
+
+    applier_module._linux_rename_noreplace(
+        guard,
+        tmp_path / "source",
+        tmp_path / "destination",
+    )
+
+    assert renameat2.calls == [(456, b"source", 456, b"destination", 1)]
+
+
+def test_linux_renameat2_syscall_fallback_uses_known_architecture_number(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    syscall = _FakeCFunction()
+    monkeypatch.setattr(
+        applier_module.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: SimpleNamespace(syscall=syscall),
+    )
+    monkeypatch.setattr(applier_module.platform, "machine", lambda: "x86_64")
+    guard = applier_module._ParentGuard(
+        root=tmp_path,
+        parent=tmp_path,
+        identities=(),
+    )
+
+    applier_module._linux_rename_noreplace(
+        guard,
+        tmp_path / "source",
+        tmp_path / "destination",
+    )
+
+    assert len(syscall.calls) == 1
+    call = syscall.calls[0]
+    assert call[0].value == 316
+    assert call[1].value == -100
+    assert call[2].value == os.fsencode(tmp_path / "source")
+    assert call[3].value == -100
+    assert call[4].value == os.fsencode(tmp_path / "destination")
+    assert call[5].value == 1
+
+
+def test_linux_renameat2_fails_closed_without_known_syscall(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        applier_module.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: SimpleNamespace(syscall=_FakeCFunction()),
+    )
+    monkeypatch.setattr(applier_module.platform, "machine", lambda: "unknown")
+    source = tmp_path / "source"
+    source.write_bytes(b"owned\n")
+    guard = applier_module._ParentGuard(
+        root=tmp_path,
+        parent=tmp_path,
+        identities=(),
+    )
+
+    with pytest.raises(StaleSyncPlanError, match="preserved source entry"):
+        applier_module._linux_rename_noreplace(
+            guard,
+            source,
+            tmp_path / "destination",
+        )
+
+    assert source.read_bytes() == b"owned\n"
+
+
+def test_macos_no_replace_wrappers_use_exclusive_flag_and_dirfd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    renameatx_np = _FakeCFunction()
+    renamex_np = _FakeCFunction()
+    monkeypatch.setattr(
+        applier_module.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            renameatx_np=renameatx_np,
+            renamex_np=renamex_np,
+        ),
+    )
+    anchored_guard = applier_module._ParentGuard(
+        root=tmp_path,
+        parent=tmp_path,
+        identities=(),
+        descriptor=789,
+    )
+    fallback_guard = applier_module._ParentGuard(
+        root=tmp_path,
+        parent=tmp_path,
+        identities=(),
+    )
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+
+    applier_module._macos_rename_noreplace(anchored_guard, source, destination)
+    applier_module._macos_rename_noreplace(fallback_guard, source, destination)
+
+    assert renameatx_np.calls == [(789, b"source", 789, b"destination", 0x4)]
+    assert renamex_np.calls == [
+        (os.fsencode(source), os.fsencode(destination), 0x4)
+    ]
+
+
+def test_macos_no_replace_fails_closed_without_safe_primitive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        applier_module.ctypes,
+        "CDLL",
+        lambda *_args, **_kwargs: SimpleNamespace(),
+    )
+    source = tmp_path / "source"
+    source.write_bytes(b"owned\n")
+    guard = applier_module._ParentGuard(
+        root=tmp_path,
+        parent=tmp_path,
+        identities=(),
+    )
+
+    with pytest.raises(StaleSyncPlanError, match="preserved source entry"):
+        applier_module._macos_rename_noreplace(
+            guard,
+            source,
+            tmp_path / "destination",
+        )
+
+    assert source.read_bytes() == b"owned\n"
+
+
+def test_posix_fallback_delete_revalidates_then_removes_verified_quarantine(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quarantine = tmp_path / ".generated.skillcord.quarantine"
+    quarantine.write_bytes(b"staged\n")
+    expected = _staged_entry(quarantine)
+    monkeypatch.setattr(applier_module, "_directory_relative_operations_supported", lambda: False)
+    guard = applier_module._ParentGuard.open(tmp_path, tmp_path)
+    monkeypatch.setattr(applier_module.os, "name", "posix")
+
+    applier_module._delete_verified_quarantine(
+        guard,
+        quarantine,
+        expected,
+        trusted=False,
+        label="staged file changed; refusing cleanup",
+    )
+    guard.close()
+
+    assert not quarantine.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permits unlinking an open file")
+def test_fallback_observation_rejects_entry_substituted_during_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / ".generated.skillcord.tmp"
+    target.write_bytes(b"staged\n")
+    expected = _staged_entry(target)
+    attacker_bytes = b"substitute with the same size\n"
+    substituted = False
+    real_sha256 = hashlib.sha256
+
+    monkeypatch.setattr(applier_module, "_directory_relative_operations_supported", lambda: False)
+    guard = applier_module._ParentGuard.open(tmp_path, tmp_path)
+
+    def substitute_during_hash(content: bytes = b""):
+        nonlocal substituted
+        if content == b"staged\n" and not substituted:
+            target.unlink()
+            target.write_bytes(attacker_bytes)
+            substituted = True
+        return real_sha256(content)
+
+    monkeypatch.setattr(applier_module.hashlib, "sha256", substitute_during_hash)
+
+    try:
+        with pytest.raises(StaleSyncPlanError, match="staged file changed"):
+            applier_module._verify_entry_at(
+                guard,
+                target,
+                expected,
+                trusted=False,
+            )
+    finally:
+        guard.close()
+
+    assert substituted is True
+    assert target.read_bytes() == attacker_bytes
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permits unlinking an open file")
+def test_anchored_observation_rejects_entry_substituted_during_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / ".generated.skillcord.tmp"
+    target.write_bytes(b"staged\n")
+    expected = _staged_entry(target)
+    attacker_bytes = b"anchored substitute\n"
+    substituted = False
+    real_sha256 = hashlib.sha256
+    guard = applier_module._ParentGuard.open(tmp_path, tmp_path)
+    if guard.descriptor is None:
+        pytest.skip("directory-relative operations are unavailable")
+
+    def substitute_during_hash(content: bytes = b""):
+        nonlocal substituted
+        if content == b"staged\n" and not substituted:
+            target.unlink()
+            target.write_bytes(attacker_bytes)
+            substituted = True
+        return real_sha256(content)
+
+    monkeypatch.setattr(applier_module.hashlib, "sha256", substitute_during_hash)
+
+    try:
+        with pytest.raises(StaleSyncPlanError, match="staged file changed"):
+            applier_module._verify_entry_at(
+                guard,
+                target,
+                expected,
+                trusted=True,
+            )
+    finally:
+        guard.close()
+
+    assert substituted is True
+    assert target.read_bytes() == attacker_bytes
+
+
+def test_fallback_cleanup_preserves_substitute_installed_before_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    temporary = tmp_path / ".generated.skillcord.tmp"
+    temporary.write_bytes(b"staged\n")
+    entry = _staged_entry(temporary)
+    attacker_bytes = b"fallback delete substitute\n"
+    substituted = False
+    real_verify = applier_module._verify_entry_at
+
+    monkeypatch.setattr(applier_module, "_directory_relative_operations_supported", lambda: False)
+    monkeypatch.setattr(applier_module.secrets, "token_hex", lambda _size: "fallback-delete")
+    guard = applier_module._ParentGuard.open(tmp_path, tmp_path)
+
+    def verify_then_substitute(
+        guarded: applier_module._ParentGuard,
+        path: Path,
+        expected: applier_module._StagedEntry,
+        *,
+        trusted: bool,
+        label: str = "staged file changed",
+    ) -> None:
+        nonlocal substituted
+        real_verify(guarded, path, expected, trusted=trusted, label=label)
+        if path.name.endswith(".skillcord.quarantine") and not substituted:
+            path.unlink()
+            path.write_bytes(attacker_bytes)
+            substituted = True
+
+    monkeypatch.setattr(applier_module, "_verify_entry_at", verify_then_substitute)
+
+    errors = applier_module._cleanup_entries(guard, [entry])
+    guard.close()
+
+    assert substituted is True
+    assert len(errors) == 1
+    assert "refusing" in str(errors[0])
+    preserved = [path for path in tmp_path.iterdir() if path.read_bytes() == attacker_bytes]
+    assert len(preserved) == 1
+    assert preserved[0].name.endswith(".skillcord.quarantine")
+
+
+def test_anchored_cleanup_preserves_substitute_installed_before_delete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "nested"
+    parent.mkdir()
+    temporary = parent / ".generated.skillcord.tmp"
+    temporary.write_bytes(b"staged\n")
+    entry = _staged_entry(temporary)
+    attacker_bytes = b"anchored delete substitute\n"
+    substituted = False
+    real_verify = applier_module._verify_entry_at
+    real_open = os.open
+    real_rename = os.rename
+    real_unlink = os.unlink
+
+    guard = applier_module._ParentGuard.open(tmp_path, parent)
+    simulated_descriptor = guard.descriptor is None
+    if simulated_descriptor:
+        guard.descriptor = 12345
+
+        def resolved(path: object, dir_fd: int | None) -> Path:
+            candidate = Path(os.fspath(path))
+            return parent / candidate if dir_fd == guard.descriptor else candidate
+
+        def anchored_open(
+            path: object,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            return real_open(resolved(path, dir_fd), flags, mode)
+
+        def anchored_rename(
+            source: object,
+            destination: object,
+            *,
+            src_dir_fd: int | None = None,
+            dst_dir_fd: int | None = None,
+        ) -> None:
+            real_rename(resolved(source, src_dir_fd), resolved(destination, dst_dir_fd))
+
+        def anchored_unlink(path: object, *, dir_fd: int | None = None) -> None:
+            real_unlink(resolved(path, dir_fd))
+
+        monkeypatch.setattr(os, "open", anchored_open)
+        monkeypatch.setattr(os, "rename", anchored_rename)
+        monkeypatch.setattr(os, "unlink", anchored_unlink)
+
+    monkeypatch.setattr(applier_module.secrets, "token_hex", lambda _size: "anchored-delete")
+
+    def verify_then_substitute(
+        guarded: applier_module._ParentGuard,
+        path: Path,
+        expected: applier_module._StagedEntry,
+        *,
+        trusted: bool,
+        label: str = "staged file changed",
+    ) -> None:
+        nonlocal substituted
+        real_verify(guarded, path, expected, trusted=trusted, label=label)
+        if path.name.endswith(".skillcord.quarantine") and not substituted:
+            path.unlink()
+            path.write_bytes(attacker_bytes)
+            substituted = True
+
+    monkeypatch.setattr(applier_module, "_verify_entry_at", verify_then_substitute)
+
+    errors = applier_module._cleanup_entries(guard, [entry])
+    if not simulated_descriptor:
+        guard.close()
+
+    assert substituted is True
+    assert len(errors) == 1
+    assert "refusing" in str(errors[0])
+    preserved = [path for path in parent.iterdir() if path.read_bytes() == attacker_bytes]
+    assert len(preserved) == 1
+    assert preserved[0].name.endswith(".skillcord.quarantine")
 
 
 def test_fallback_detects_parent_swap_before_writing_staged_bytes(
@@ -1018,71 +1491,61 @@ def test_anchored_temp_cleanup_uses_retained_directory_descriptor(
     parent.mkdir()
     temporary = parent / ".generated.secret.skillcord.tmp"
     temporary.write_bytes(b"staged\n")
-    guard = applier_module._ParentGuard(
-        root=tmp_path,
-        parent=parent,
-        identities=(),
-        descriptor=12345,
-    )
+    guard = applier_module._ParentGuard.open(tmp_path, parent)
     entry = _staged_entry(temporary)
     real_open = os.open
-    real_fstat = os.fstat
-    real_close = os.close
     real_rename = os.rename
-    real_unlink = os.unlink
     renamed: list[tuple[object, object, int | None, int | None]] = []
-    unlinked: list[tuple[object, int | None]] = []
+    simulated_descriptor = guard.descriptor is None
+    if simulated_descriptor:
+        guard.descriptor = 12345
 
-    def resolved(path: object, dir_fd: int | None) -> Path:
-        candidate = Path(os.fspath(path))
-        return parent / candidate if dir_fd == guard.descriptor else candidate
+        def resolved(path: object, dir_fd: int | None) -> Path:
+            candidate = Path(os.fspath(path))
+            return parent / candidate if dir_fd == guard.descriptor else candidate
 
-    def anchored_open(
-        path: object,
-        flags: int,
-        mode: int = 0o777,
-        *,
-        dir_fd: int | None = None,
-    ) -> int:
-        return real_open(resolved(path, dir_fd), flags, mode)
+        def anchored_open(
+            path: object,
+            flags: int,
+            mode: int = 0o777,
+            *,
+            dir_fd: int | None = None,
+        ) -> int:
+            return real_open(resolved(path, dir_fd), flags, mode)
 
-    def anchored_rename(
-        source: object,
-        destination: object,
-        *,
-        src_dir_fd: int | None = None,
-        dst_dir_fd: int | None = None,
-    ) -> None:
-        renamed.append((source, destination, src_dir_fd, dst_dir_fd))
-        real_rename(resolved(source, src_dir_fd), resolved(destination, dst_dir_fd))
+        def anchored_rename(
+            source: object,
+            destination: object,
+            *,
+            src_dir_fd: int | None = None,
+            dst_dir_fd: int | None = None,
+        ) -> None:
+            renamed.append((source, destination, src_dir_fd, dst_dir_fd))
+            real_rename(resolved(source, src_dir_fd), resolved(destination, dst_dir_fd))
+
+        monkeypatch.setattr(os, "open", anchored_open)
+        monkeypatch.setattr(os, "rename", anchored_rename)
 
     def fail_path_verification() -> None:
         raise StaleSyncPlanError("parent directory changed")
 
-    def record_unlink(path: object, *, dir_fd: int | None = None) -> None:
-        real_unlink(resolved(path, dir_fd))
-        unlinked.append((path, dir_fd))
-
     monkeypatch.setattr(guard, "verify", fail_path_verification)
-    monkeypatch.setattr(os, "open", anchored_open)
-    monkeypatch.setattr(os, "fstat", real_fstat)
-    monkeypatch.setattr(os, "close", real_close)
-    monkeypatch.setattr(os, "rename", anchored_rename)
-    monkeypatch.setattr(os, "unlink", record_unlink)
     monkeypatch.setattr(applier_module.secrets, "token_hex", lambda _size: "anchored")
 
     errors = applier_module._cleanup_entries(guard, [entry])
 
+    if simulated_descriptor:
+        assert renamed == [
+            (
+                temporary.name,
+                f".{temporary.name}.anchored.skillcord.quarantine",
+                12345,
+                12345,
+            )
+        ]
+    else:
+        guard.close()
     assert errors == []
-    assert renamed == [
-        (
-            temporary.name,
-            f".{temporary.name}.anchored.skillcord.quarantine",
-            12345,
-            12345,
-        )
-    ]
-    assert unlinked == [(f".{temporary.name}.anchored.skillcord.quarantine", 12345)]
     assert list(parent.iterdir()) == []
 
 
@@ -1095,17 +1558,15 @@ def test_anchored_cleanup_preserves_substitution_moved_to_quarantine(
     temporary = parent / ".generated.secret.skillcord.tmp"
     temporary.write_bytes(b"staged\n")
     entry = _staged_entry(temporary)
-    guard = applier_module._ParentGuard(
-        root=tmp_path,
-        parent=parent,
-        identities=(),
-        descriptor=12345,
-    )
+    guard = applier_module._ParentGuard.open(tmp_path, parent)
     real_open = os.open
+    real_rename_noreplace = applier_module._atomic_rename_noreplace
     real_rename = os.rename
-    real_unlink = os.unlink
     attacker_bytes = b"anchored substitute\n"
     substitution_happened = False
+    simulated_descriptor = guard.descriptor is None
+    if simulated_descriptor:
+        guard.descriptor = 12345
 
     def resolved(path: object, dir_fd: int | None) -> Path:
         candidate = Path(os.fspath(path))
@@ -1121,32 +1582,30 @@ def test_anchored_cleanup_preserves_substitution_moved_to_quarantine(
         return real_open(resolved(path, dir_fd), flags, mode)
 
     def substitute_then_rename(
-        source: object,
-        destination: object,
-        *,
-        src_dir_fd: int | None = None,
-        dst_dir_fd: int | None = None,
+        guarded: applier_module._ParentGuard,
+        source: Path,
+        destination: Path,
     ) -> None:
         nonlocal substitution_happened
-        source_path = resolved(source, src_dir_fd)
-        source_path.unlink()
-        source_path.write_bytes(attacker_bytes)
+        source.unlink()
+        source.write_bytes(attacker_bytes)
         substitution_happened = True
-        real_rename(source_path, resolved(destination, dst_dir_fd))
-
-    def anchored_unlink(path: object, *, dir_fd: int | None = None) -> None:
-        real_unlink(resolved(path, dir_fd))
+        if simulated_descriptor:
+            real_rename(source, destination)
+        else:
+            real_rename_noreplace(guarded, source, destination)
 
     def fail_path_verification() -> None:
         raise StaleSyncPlanError("parent directory changed")
 
     monkeypatch.setattr(guard, "verify", fail_path_verification)
     monkeypatch.setattr(os, "open", anchored_open)
-    monkeypatch.setattr(os, "rename", substitute_then_rename)
-    monkeypatch.setattr(os, "unlink", anchored_unlink)
+    monkeypatch.setattr(applier_module, "_atomic_rename_noreplace", substitute_then_rename)
     monkeypatch.setattr(applier_module.secrets, "token_hex", lambda _size: "anchored")
 
     errors = applier_module._cleanup_entries(guard, [entry])
+    if not simulated_descriptor:
+        guard.close()
 
     assert substitution_happened is True
     assert len(errors) == 1
@@ -1203,18 +1662,14 @@ def test_cleanup_failure_does_not_mask_staging_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     plan = _plan(tmp_path)
-    original_unlink = os.unlink
-
     def fail_fsync(_descriptor: int) -> None:
         raise OSError("originating staging failure")
 
-    def fail_temp_cleanup(path: object, *args: object, **kwargs: object) -> None:
-        if ".skillcord.tmp" in os.fspath(path):
-            raise OSError("secondary cleanup failure")
-        original_unlink(path, *args, **kwargs)
+    def fail_temp_cleanup(*_args: object, **_kwargs: object) -> None:
+        raise OSError("secondary cleanup failure")
 
     monkeypatch.setattr(os, "fsync", fail_fsync)
-    monkeypatch.setattr(os, "unlink", fail_temp_cleanup)
+    monkeypatch.setattr(applier_module, "_delete_verified_quarantine", fail_temp_cleanup)
 
     with pytest.raises(OSError, match="originating staging failure") as raised:
         SyncApplier().apply(plan, approved=True)
