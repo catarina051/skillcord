@@ -2,11 +2,42 @@
 
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any
+from typing import Any, TextIO
 
 import yaml  # type: ignore[import-untyped]
 
 from skillcord.models.config import CapabilityOverride, OverrideConfig
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):  # type: ignore[misc]
+    """Safe YAML loader that rejects ambiguous duplicate mapping keys."""
+
+
+def _construct_unique_mapping(
+    loader: Any,
+    node: Any,
+    deep: bool = False,
+) -> dict[Any, Any]:
+    """Construct a mapping without PyYAML's default last-value-wins behavior."""
+
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key ({key!r})",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_UniqueKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
 
 
 class DecisionStore:
@@ -22,11 +53,31 @@ class DecisionStore:
             return OverrideConfig(schema_version=1)
 
         with self.path.open(encoding="utf-8") as overrides_file:
-            data = yaml.safe_load(overrides_file)
+            data = _load_yaml(overrides_file)
         return OverrideConfig.model_validate(data)
 
     def save(self, config: OverrideConfig) -> None:
-        """Atomically write ``config`` in deterministic YAML order."""
+        """Validate any existing file, then atomically write ``config``."""
+
+        if self.path.exists():
+            self.load()
+        self._write(config)
+
+    def save_decision(
+        self,
+        capability_id: str,
+        prefer: str | None,
+        suppress: list[str],
+    ) -> None:
+        """Persist one explicit ownership decision without discarding existing decisions."""
+
+        config = self.load()
+        overrides = dict(config.overrides)
+        overrides[capability_id] = CapabilityOverride(prefer=prefer, suppress=suppress)
+        self._write(config.model_copy(update={"overrides": overrides}))
+
+    def _write(self, config: OverrideConfig) -> None:
+        """Atomically write a config whose existing on-disk state was validated."""
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = _serialize_config(config)
@@ -56,18 +107,11 @@ class DecisionStore:
                 temporary_path.unlink(missing_ok=True)
             raise
 
-    def save_decision(
-        self,
-        capability_id: str,
-        prefer: str | None,
-        suppress: list[str],
-    ) -> None:
-        """Persist one explicit ownership decision without discarding existing decisions."""
 
-        config = self.load()
-        overrides = dict(config.overrides)
-        overrides[capability_id] = CapabilityOverride(prefer=prefer, suppress=suppress)
-        self.save(config.model_copy(update={"overrides": overrides}))
+def _load_yaml(overrides_file: TextIO) -> object:
+    """Load one YAML document while rejecting duplicate keys at every nesting level."""
+
+    return yaml.load(overrides_file, Loader=_UniqueKeySafeLoader)
 
 
 def _serialize_config(config: OverrideConfig) -> dict[str, Any]:
