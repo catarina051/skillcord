@@ -3,7 +3,9 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from skillcord.normalization.ids import validate_canonical_identifier
 
 
 class SkillRecord(BaseModel):
@@ -20,6 +22,13 @@ class SkillRecord(BaseModel):
     harnesses: set[str] = Field(default_factory=set)
     optional: bool = False
     execution_mode: Literal["provider", "harness_only"] = "provider"
+
+    @field_validator("provider_id", "skill_id")
+    @classmethod
+    def validate_identifiers(cls, value: str) -> str:
+        """Reject identifiers that could escape generated policy references."""
+
+        return validate_canonical_identifier(value)
 
     @property
     def normalized_id(self) -> str:
@@ -62,3 +71,10 @@ class ProviderSnapshot(BaseModel):
     runtime_requirements: dict[str, str] = Field(default_factory=dict)
     partial_support: bool = False
     unsupported_assets: list[UnsupportedAsset] = Field(default_factory=list)
+
+    @field_validator("provider_id")
+    @classmethod
+    def validate_provider_id(cls, value: str) -> str:
+        """Keep provider snapshot identities within the canonical grammar."""
+
+        return validate_canonical_identifier(value)

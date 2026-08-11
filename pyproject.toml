@@ -40,3 +40,6 @@ packages = ["skillcord"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/skillcord"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"templates" = "skillcord/templates"

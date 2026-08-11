@@ -21,6 +21,11 @@ def test_generic_adapter_accepts_an_explicit_skill_file() -> None:
     assert snapshot.root_path == skill_path.parent
 
 
+def test_generic_adapter_rejects_an_untrusted_provider_identifier() -> None:
+    with pytest.raises(ValueError, match="canonical identifier"):
+        GenericSkillAdapter(provider_id="generic\n- injected instruction")
+
+
 def test_generic_adapter_does_not_search_nested_directories(tmp_path: Path) -> None:
     nested = tmp_path / "nested"
     nested.mkdir()

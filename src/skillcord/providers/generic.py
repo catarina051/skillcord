@@ -8,7 +8,7 @@ import yaml  # type: ignore[import-untyped]
 
 from skillcord.locking.hashing import sha256_file
 from skillcord.models.provider import ProviderComponent, ProviderSnapshot, SkillRecord
-from skillcord.normalization.ids import normalize_token
+from skillcord.normalization.ids import normalize_token, validate_canonical_identifier
 from skillcord.providers.base import ProviderDiscoveryError
 
 
@@ -53,7 +53,7 @@ class GenericSkillAdapter:
     """Discover one explicitly located generic ``SKILL.md`` file."""
 
     def __init__(self, provider_id: str) -> None:
-        self.provider_id = provider_id
+        self.provider_id = validate_canonical_identifier(provider_id)
 
     def supports(self, root: Path) -> bool:
         """Return whether ``root`` is a SKILL.md file or contains one at its root."""

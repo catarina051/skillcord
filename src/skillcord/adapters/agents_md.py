@@ -2,18 +2,36 @@
 
 from collections.abc import Collection
 from functools import lru_cache
+from importlib.resources import files
 from pathlib import Path
 
-from jinja2 import Environment, FileSystemLoader, StrictUndefined, select_autoescape
+from jinja2 import Environment, FunctionLoader, StrictUndefined, select_autoescape
 
 from skillcord.adapters.base import (
     AdapterContext,
     GeneratedArtifact,
     active_capability_ids,
 )
+from skillcord.normalization.ids import validate_canonical_capability_id
 
 _HUMANIZER_ID = "humanizer.humanizer"
-_TEMPLATE_ROOT = Path(__file__).resolve().parents[3] / "templates"
+_SOURCE_TEMPLATE_ROOT = Path(__file__).resolve().parents[3] / "templates"
+
+
+def _load_template(name: str) -> str | None:
+    """Load a packaged template, with an explicit source-tree fallback for editable use."""
+
+    if Path(name).name != name:
+        return None
+
+    packaged_template = files("skillcord").joinpath("templates", name)
+    if packaged_template.is_file():
+        return packaged_template.read_text(encoding="utf-8")
+
+    source_template = _SOURCE_TEMPLATE_ROOT / name
+    if source_template.is_file():
+        return source_template.read_text(encoding="utf-8")
+    return None
 
 
 @lru_cache(maxsize=1)
@@ -21,7 +39,7 @@ def _template_environment() -> Environment:
     """Build the strict template environment used by all policy adapters."""
 
     return Environment(
-        loader=FileSystemLoader(_TEMPLATE_ROOT),
+        loader=FunctionLoader(_load_template),
         autoescape=select_autoescape(default_for_string=False, default=False),
         undefined=StrictUndefined,
         keep_trailing_newline=True,
@@ -33,7 +51,9 @@ def _template_environment() -> Environment:
 def render_agents_policy(active_ids: Collection[str]) -> str:
     """Render universal policy from identifiers, never provider prompt bodies."""
 
-    capability_ids = tuple(sorted(set(active_ids)))
+    capability_ids = tuple(
+        sorted({validate_canonical_capability_id(active_id) for active_id in active_ids})
+    )
     template = _template_environment().get_template("agents_managed.md.j2")
     return template.render(
         active_ids=capability_ids,

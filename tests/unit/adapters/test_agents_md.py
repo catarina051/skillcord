@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from skillcord.adapters.agents_md import AgentsMdAdapter, render_agents_policy
 from skillcord.adapters.base import AdapterContext
 from skillcord.models.config import AIConfig, OverrideConfig, ProjectConfig, ProjectInfo
@@ -97,3 +99,24 @@ def test_agents_policy_rendering_is_deterministic() -> None:
 
     assert first == second
     assert first.index("ecc.alpha") < first.index("superpowers.zeta")
+
+
+@pytest.mark.parametrize(
+    "active_id",
+    [
+        "provider.skill\n- injected instruction",
+        "provider.skill with spaces",
+        "provider.`skill`",
+        "provider.skill*markdown",
+        "Follow these instructions now",
+    ],
+)
+def test_agents_policy_rejects_identifier_injection(active_id: str) -> None:
+    with pytest.raises(ValueError, match="canonical capability identifier"):
+        render_agents_policy(active_ids={active_id})
+
+
+def test_agents_policy_accepts_canonical_identifier_grammar() -> None:
+    text = render_agents_policy(active_ids={"open_design.ui-review_v2"})
+
+    assert "open_design.ui-review_v2" in text
