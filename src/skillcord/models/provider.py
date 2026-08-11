@@ -41,6 +41,14 @@ class ProviderComponent(BaseModel):
         return self.source_revision
 
 
+class UnsupportedAsset(BaseModel):
+    """A provider artifact discovered but deliberately not activated by V1."""
+
+    kind: str
+    source_path: Path
+    reason: str
+
+
 class ProviderSnapshot(BaseModel):
     """The complete discovered state for one provider."""
 
@@ -49,4 +57,4 @@ class ProviderSnapshot(BaseModel):
     skills: list[SkillRecord] = Field(default_factory=list)
     components: list[ProviderComponent] = Field(default_factory=list)
     partial_support: bool = False
-    unsupported_assets: list[str] = Field(default_factory=list)
+    unsupported_assets: list[UnsupportedAsset] = Field(default_factory=list)
