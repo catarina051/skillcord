@@ -23,7 +23,16 @@ def _construct_mapping_without_duplicates(
     mapping: dict[Any, Any] = {}
     for key_node, value_node in node.value:
         key = loader.construct_object(key_node, deep=deep)
-        if key in mapping:
+        try:
+            duplicate = key in mapping
+        except TypeError as error:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found unsupported unhashable mapping key",
+                key_node.start_mark,
+            ) from error
+        if duplicate:
             raise yaml.constructor.ConstructorError(
                 "while constructing a mapping",
                 node.start_mark,

@@ -37,6 +37,16 @@ def test_generic_adapter_rejects_malformed_frontmatter(tmp_path: Path) -> None:
         GenericSkillAdapter(provider_id="generic").discover(tmp_path)
 
 
+def test_generic_adapter_rejects_unhashable_frontmatter_mapping_keys(tmp_path: Path) -> None:
+    (tmp_path / "SKILL.md").write_text(
+        "---\n? [unsupported, key]\n: value\nname: Valid\n---\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ProviderDiscoveryError):
+        GenericSkillAdapter(provider_id="generic").discover(tmp_path)
+
+
 @pytest.mark.parametrize(
     "frontmatter",
     [
