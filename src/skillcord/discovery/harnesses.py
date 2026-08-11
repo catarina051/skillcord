@@ -13,6 +13,15 @@ class HarnessDetection:
     path: Path
 
 
+@dataclass(frozen=True)
+class RejectedHarnessCandidate:
+    """An injected hint refused before it could probe outside the project."""
+
+    harness_id: str
+    path: Path
+    reason: str
+
+
 class HarnessDetector:
     """Detect harnesses from supplied project-relative candidate paths only."""
 
@@ -36,21 +45,47 @@ class HarnessDetector:
         for harness_id in sorted(self._candidate_paths):
             candidate = next(
                 (
-                    path
+                    resolved_candidate
                     for path in self._candidate_paths[harness_id]
-                    if self._resolve_candidate(resolved_root, path).exists()
+                    if (resolved_candidate := self._project_relative_candidate(resolved_root, path))
+                    is not None
+                    and resolved_candidate.exists()
                 ),
                 None,
             )
             if candidate is not None:
                 detections.append(
-                    HarnessDetection(
-                        harness_id=harness_id,
-                        path=self._resolve_candidate(resolved_root, candidate),
-                    )
+                    HarnessDetection(harness_id=harness_id, path=candidate)
                 )
         return tuple(detections)
 
+    def rejected_candidates(self, project_root: Path) -> tuple[RejectedHarnessCandidate, ...]:
+        """Return invalid candidates without checking whether their targets exist."""
+
+        resolved_root = project_root.resolve()
+        rejected: list[RejectedHarnessCandidate] = []
+        for harness_id in sorted(self._candidate_paths):
+            for candidate in self._candidate_paths[harness_id]:
+                reason = self._rejection_reason(resolved_root, candidate)
+                if reason is not None:
+                    rejected.append(
+                        RejectedHarnessCandidate(
+                            harness_id=harness_id,
+                            path=candidate,
+                            reason=reason,
+                        )
+                    )
+        return tuple(rejected)
+
     @staticmethod
-    def _resolve_candidate(project_root: Path, candidate: Path) -> Path:
-        return candidate.resolve() if candidate.is_absolute() else (project_root / candidate).resolve()
+    def _project_relative_candidate(project_root: Path, candidate: Path) -> Path | None:
+        if HarnessDetector._rejection_reason(project_root, candidate) is not None:
+            return None
+        return (project_root / candidate).resolve()
+
+    @staticmethod
+    def _rejection_reason(project_root: Path, candidate: Path) -> str | None:
+        if candidate.is_absolute():
+            return "absolute candidate path"
+        resolved_candidate = (project_root / candidate).resolve()
+        return None if resolved_candidate.is_relative_to(project_root) else "path escapes project root"

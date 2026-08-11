@@ -62,3 +62,31 @@ def test_scan_warns_when_an_explicit_unknown_root_uses_generic_parsing(tmp_path:
     assert [warning.message for warning in result.warnings] == [
         "unknown provider parsed as an explicitly supplied generic SKILL.md root"
     ]
+
+
+def test_scan_reports_rejected_harness_candidates(tmp_path: Path) -> None:
+    """Invalid harness hints must be visible without becoming detections."""
+
+    absolute_hint = tmp_path.parent / "outside-absolute-report" / "codex.toml"
+    absolute_hint.parent.mkdir()
+    absolute_hint.write_text("host configuration", encoding="utf-8")
+    detector = HarnessDetector(
+        candidate_paths={
+            "absolute": (absolute_hint,),
+            "parent": (Path("..") / "outside-parent-report" / "codex.toml",),
+        }
+    )
+
+    result = DiscoveryService.default(harness_detector=detector).scan(
+        project_root=tmp_path, source_roots={}
+    )
+
+    assert result.harnesses == ()
+    assert [(warning.provider_id, warning.source_path, warning.message) for warning in result.warnings] == [
+        (None, absolute_hint, "harness candidate rejected: absolute candidate path"),
+        (
+            None,
+            Path("..") / "outside-parent-report" / "codex.toml",
+            "harness candidate rejected: path escapes project root",
+        ),
+    ]

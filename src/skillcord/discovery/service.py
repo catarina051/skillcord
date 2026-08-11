@@ -14,7 +14,7 @@ from skillcord.providers.base import ProviderDiscoveryError
 class DiscoveryWarning:
     """A non-fatal discovery condition that callers should present to users."""
 
-    provider_id: str
+    provider_id: str | None
     source_path: Path
     message: str
 
@@ -98,6 +98,16 @@ class DiscoveryService:
                         message="unknown provider parsed as an explicitly supplied generic SKILL.md root",
                     )
                 )
+
+        rejected_candidates = self._harness_detector.rejected_candidates(project_root)
+        warnings.extend(
+            DiscoveryWarning(
+                provider_id=None,
+                source_path=rejected.path,
+                message=f"harness candidate rejected: {rejected.reason}",
+            )
+            for rejected in rejected_candidates
+        )
 
         return DiscoveryResult(
             providers=tuple(providers),
