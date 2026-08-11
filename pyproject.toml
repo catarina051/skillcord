@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "skillcord-internal"
+version = "0.0.0"
+description = "Internal codename package for the V1 AI runtime prototype"
+requires-python = ">=3.11"
+dependencies = [
+  "jinja2>=3.1,<4",
+  "pydantic>=2.8,<3",
+  "pyyaml>=6.0,<7",
+  "typer>=0.12,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.11,<2",
+  "pytest>=8.3,<9",
+  "pytest-cov>=5,<6",
+  "ruff>=0.6,<1",
+]
+
+[project.scripts]
+skillcord-dev = "skillcord.cli.app:app"
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+packages = ["skillcord"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/skillcord"]
