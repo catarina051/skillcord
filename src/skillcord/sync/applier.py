@@ -17,6 +17,7 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 from skillcord.sync.planner import PlannedFileChange, SyncPlan, resolve_target_within_root
 
@@ -182,6 +183,18 @@ class _ParentGuard:
                 raise
         self.verify()
 
+    def unlink_staged(self, target: Path, *, missing_ok: bool) -> None:
+        """Remove a staged name through its retained trusted directory handle."""
+
+        if self.descriptor is None:
+            self.unlink(target, missing_ok=missing_ok)
+            return
+        try:
+            os.unlink(target.name, dir_fd=self.descriptor)
+        except FileNotFoundError:
+            if not missing_ok:
+                raise
+
     def close(self) -> None:
         if self.descriptor is not None:
             os.close(self.descriptor)
@@ -192,17 +205,11 @@ class _ParentGuard:
 class _StagedChange:
     change: PlannedFileChange
     guard: _ParentGuard
+    staging_guard: _ParentGuard
     replacement: Path
     backup: Path | None
     replacement_consumed: bool = False
     backup_consumed: bool = False
-
-
-@dataclass
-class _CreatedDirectory:
-    path: Path
-    identity: _PathIdentity | None
-    parent_guard: _ParentGuard
 
 
 class SyncApplier:
@@ -216,50 +223,56 @@ class SyncApplier:
 
         self._preflight(plan)
         root = plan.project_root.resolve(strict=True)
-        created_directories: list[_CreatedDirectory] = []
         staged: list[_StagedChange] = []
         try:
             for change in plan.changes:
-                _ensure_parent_directories(
-                    root,
-                    change.path.parent,
-                    created_directories,
-                    self._before_mkdir,
-                    self._after_mkdir,
-                )
                 guard = _ParentGuard.open(root, change.path.parent)
+                staging_guard = guard
                 try:
+                    if guard.descriptor is None and guard.parent != root:
+                        staging_guard = _ParentGuard.open(root, root)
                     existing_mode = guard.current_mode(change.path)
                     self._before_stage(change.path)
                     guard.verify()
                     replacement = _stage_bytes(
-                        guard,
+                        staging_guard,
                         change.path,
                         change.after,
                         existing_mode,
                         suffix=".skillcord.tmp",
+                        after_write=self._after_stage_write,
                     )
-                    self._after_stage(change.path)
                     backup: Path | None = None
                     try:
+                        self._after_stage(change.path)
                         if change.before is not None:
                             backup = _stage_bytes(
-                                guard,
+                                staging_guard,
                                 change.path,
                                 change.before,
                                 existing_mode,
                                 suffix=".skillcord.backup",
+                                after_write=self._after_stage_write,
                             )
                     except BaseException as error:
-                        _add_error_notes(error, "cleanup", _cleanup_paths(guard, [replacement]))
+                        _add_error_notes(
+                            error,
+                            "cleanup",
+                            _cleanup_paths(staging_guard, [replacement]),
+                        )
                         raise
                 except BaseException as error:
-                    _add_error_notes(error, "cleanup", _close_guard(guard))
+                    _add_error_notes(
+                        error,
+                        "cleanup",
+                        _close_unique_guards((guard, staging_guard)),
+                    )
                     raise
                 staged.append(
                     _StagedChange(
                         change=change,
                         guard=guard,
+                        staging_guard=staging_guard,
                         replacement=replacement,
                         backup=backup,
                     )
@@ -269,9 +282,6 @@ class SyncApplier:
         except BaseException as error:
             cleanup_errors = _cleanup_staged(staged)
             cleanup_errors.extend(_close_guards(staged))
-            cleanup_errors.extend(
-                _cleanup_directories(created_directories, self._before_rmdir)
-            )
             _add_error_notes(error, "cleanup", cleanup_errors)
             raise
 
@@ -281,15 +291,12 @@ class SyncApplier:
                 self._before_replace(item.change.path)
                 self._validate_staged_change(item)
                 applied.append(item)
-                item.guard.replace(item.replacement, item.change.path)
+                _replace_staged(item, item.replacement, item.change.path)
                 item.replacement_consumed = True
         except BaseException as error:
             rollback_errors = self._rollback(applied)
             cleanup_errors = _cleanup_staged(staged)
             cleanup_errors.extend(_close_guards(staged))
-            cleanup_errors.extend(
-                _cleanup_directories(created_directories, self._before_rmdir)
-            )
             if rollback_errors:
                 raise SyncRollbackError(error, rollback_errors, cleanup_errors) from error
             _add_error_notes(error, "cleanup", cleanup_errors)
@@ -297,7 +304,6 @@ class SyncApplier:
 
         cleanup_errors = _cleanup_staged(staged)
         cleanup_errors.extend(_close_guards(staged))
-        cleanup_errors.extend(_close_created_guards(created_directories))
         return ApplyResult(
             applied=True,
             changed_files=tuple(change.path for change in plan.changes),
@@ -317,16 +323,8 @@ class SyncApplier:
         """Checkpoint after staging and before the final stale-state validation."""
 
     @staticmethod
-    def _before_mkdir(_directory: Path) -> None:
-        """Checkpoint before creating a missing target parent."""
-
-    @staticmethod
-    def _before_rmdir(_directory: Path) -> None:
-        """Checkpoint before removing a directory created by this apply."""
-
-    @staticmethod
-    def _after_mkdir(_directory: Path) -> None:
-        """Checkpoint after recording ownership of a newly created directory."""
+    def _after_stage_write(_temporary: Path) -> None:
+        """Checkpoint while the staged payload handle remains open."""
 
     @staticmethod
     def _preflight(plan: SyncPlan) -> None:
@@ -339,6 +337,10 @@ class SyncApplier:
         target, _relative = resolve_target_within_root(root, change.path)
         if target != change.path:
             raise StaleSyncPlanError(f"target path changed after preview: {change.relative_path}")
+        if not target.parent.is_dir():
+            raise StaleSyncPlanError(
+                f"target parent does not exist: {change.relative_path.parent.as_posix()}"
+            )
         if target.exists() and not target.is_file():
             raise StaleSyncPlanError(
                 f"file changed after preview: {change.relative_path.as_posix()}"
@@ -357,6 +359,7 @@ class SyncApplier:
 
     @staticmethod
     def _validate_staged_change(item: _StagedChange) -> None:
+        item.staging_guard.verify()
         current = item.guard.current_bytes(item.change.path)
         if current != item.change.before:
             raise StaleSyncPlanError(
@@ -381,7 +384,7 @@ class SyncApplier:
                 else:
                     if item.backup is None:
                         raise RuntimeError("missing rollback backup for existing file")
-                    item.guard.replace(item.backup, item.change.path)
+                    _replace_staged(item, item.backup, item.change.path)
                     item.backup_consumed = True
             except (OSError, RuntimeError) as error:
                 errors.append(error)
@@ -393,8 +396,6 @@ def _directory_relative_operations_supported() -> bool:
         os.rename in os.supports_dir_fd
         and os.open in os.supports_dir_fd
         and os.unlink in os.supports_dir_fd
-        and os.mkdir in os.supports_dir_fd
-        and os.rmdir in os.supports_dir_fd
         and hasattr(os, "O_DIRECTORY")
         and hasattr(os, "O_NOFOLLOW")
         and hasattr(os, "fchmod")
@@ -414,114 +415,6 @@ def _capture_parent_chain(root: Path, parent: Path) -> tuple[_PathIdentity, ...]
     return tuple(_PathIdentity.capture(path) for path in chain)
 
 
-def _ensure_parent_directories(
-    root: Path,
-    parent: Path,
-    created: list[_CreatedDirectory],
-    before_mkdir: Callable[[Path], None],
-    after_mkdir: Callable[[Path], None],
-) -> None:
-    relative = parent.relative_to(root)
-    if _directory_relative_operations_supported():
-        _ensure_parent_directories_anchored(
-            root,
-            relative,
-            created,
-            before_mkdir,
-            after_mkdir,
-        )
-        return
-
-    current = root
-    for part in relative.parts:
-        current /= part
-        if not current.exists():
-            parent_identity = _PathIdentity.capture(current.parent)
-            parent_guard = _ParentGuard.open(root, current.parent)
-            try:
-                before_mkdir(current)
-                parent_identity.verify()
-                current.mkdir()
-            except BaseException as error:
-                _add_error_notes(error, "cleanup", _close_guard(parent_guard))
-                raise
-            created_item = _begin_created_directory(current, parent_guard, created)
-            created_item.identity = _PathIdentity.capture(current)
-            after_mkdir(current)
-            parent_identity.verify()
-        _PathIdentity.capture(current)
-
-
-def _ensure_parent_directories_anchored(
-    root: Path,
-    relative: Path,
-    created: list[_CreatedDirectory],
-    before_mkdir: Callable[[Path], None],
-    after_mkdir: Callable[[Path], None],
-) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    current_path = root
-    expected = _PathIdentity.capture(root)
-    current_descriptor = os.open(root, flags)
-    try:
-        _verify_open_directory(current_descriptor, expected)
-        for part in relative.parts:
-            child_path = current_path / part
-            child_created = False
-            try:
-                child_descriptor = os.open(part, flags, dir_fd=current_descriptor)
-            except FileNotFoundError:
-                before_mkdir(child_path)
-                expected.verify()
-                _verify_open_directory(current_descriptor, expected)
-                parent_guard = _ParentGuard.open(root, current_path)
-                try:
-                    os.mkdir(part, dir_fd=current_descriptor)
-                except BaseException as error:
-                    _add_error_notes(error, "cleanup", _close_guard(parent_guard))
-                    raise
-                created_item = _begin_created_directory(child_path, parent_guard, created)
-                child_descriptor = os.open(part, flags, dir_fd=current_descriptor)
-                child_created = True
-            child_metadata = os.fstat(child_descriptor)
-            if not stat.S_ISDIR(child_metadata.st_mode):
-                os.close(child_descriptor)
-                raise StaleSyncPlanError(f"parent path is not a directory: {child_path}")
-            if child_created:
-                created_item.identity = _identity_from_metadata(child_path, child_metadata)
-                after_mkdir(child_path)
-            os.close(current_descriptor)
-            current_descriptor = child_descriptor
-            current_path = child_path
-            expected = _PathIdentity.capture(current_path)
-            _verify_open_directory(current_descriptor, expected)
-    finally:
-        os.close(current_descriptor)
-
-
-def _begin_created_directory(
-    directory: Path,
-    parent_guard: _ParentGuard,
-    created: list[_CreatedDirectory],
-) -> _CreatedDirectory:
-    item = _CreatedDirectory(
-        path=directory,
-        identity=None,
-        parent_guard=parent_guard,
-    )
-    created.append(item)
-    return item
-
-
-def _identity_from_metadata(path: Path, metadata: os.stat_result) -> _PathIdentity:
-    return _PathIdentity(
-        path=path,
-        device=metadata.st_dev,
-        inode=metadata.st_ino,
-        file_type=stat.S_IFMT(metadata.st_mode),
-    )
-
-
 def _verify_open_directory(descriptor: int, expected: _PathIdentity) -> None:
     opened = os.fstat(descriptor)
     if (opened.st_dev, opened.st_ino, stat.S_IFMT(opened.st_mode)) != (
@@ -539,6 +432,7 @@ def _stage_bytes(
     mode: int | None,
     *,
     suffix: str,
+    after_write: Callable[[Path], None],
 ) -> Path:
     guard.verify()
     if guard.descriptor is not None:
@@ -552,18 +446,21 @@ def _stage_bytes(
         temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as stream:
-            guard.verify()
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-            if mode is not None and guard.descriptor is not None:
-                descriptor_chmod = getattr(os, "fchmod", None)
-                if descriptor_chmod is None:
-                    raise RuntimeError("descriptor chmod unavailable for anchored staging")
-                descriptor_chmod(stream.fileno(), mode)
-        if mode is not None and guard.descriptor is None:
-            os.chmod(temporary, mode)
-        guard.verify()
+            try:
+                guard.verify()
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+                if mode is not None:
+                    descriptor_chmod = getattr(os, "fchmod", None)
+                    if descriptor_chmod is None:
+                        raise RuntimeError("descriptor chmod unavailable for safe staging")
+                    descriptor_chmod(stream.fileno(), mode)
+                after_write(temporary)
+                guard.verify()
+            except BaseException as error:
+                _add_error_notes(error, "payload scrub", _truncate_open_stream(stream))
+                raise
         return temporary
     except BaseException as error:
         _add_error_notes(error, "cleanup", _cleanup_paths(guard, [temporary]))
@@ -597,7 +494,7 @@ def _cleanup_paths(guard: _ParentGuard, paths: list[Path]) -> list[BaseException
     errors: list[BaseException] = []
     for path in paths:
         try:
-            guard.unlink(path, missing_ok=True)
+            guard.unlink_staged(path, missing_ok=True)
         except (OSError, StaleSyncPlanError) as error:
             errors.append(error)
     return errors
@@ -611,7 +508,7 @@ def _cleanup_staged(staged: list[_StagedChange]) -> list[BaseException]:
             paths.append(item.replacement)
         if item.backup is not None and not item.backup_consumed:
             paths.append(item.backup)
-        errors.extend(_cleanup_paths(item.guard, paths))
+        errors.extend(_cleanup_paths(item.staging_guard, paths))
     return errors
 
 
@@ -624,43 +521,43 @@ def _close_guard(guard: _ParentGuard) -> list[BaseException]:
 
 
 def _close_guards(staged: list[_StagedChange]) -> list[BaseException]:
+    return _close_unique_guards(
+        tuple(guard for item in staged for guard in (item.guard, item.staging_guard))
+    )
+
+
+def _close_unique_guards(guards: tuple[_ParentGuard, ...]) -> list[BaseException]:
     errors: list[BaseException] = []
-    for item in staged:
-        errors.extend(_close_guard(item.guard))
+    closed: set[int] = set()
+    for guard in guards:
+        identity = id(guard)
+        if identity in closed:
+            continue
+        closed.add(identity)
+        errors.extend(_close_guard(guard))
     return errors
 
 
-def _close_created_guards(created: list[_CreatedDirectory]) -> list[BaseException]:
-    errors: list[BaseException] = []
-    for item in created:
-        errors.extend(_close_guard(item.parent_guard))
-    return errors
+def _replace_staged(item: _StagedChange, source: Path, target: Path) -> None:
+    item.staging_guard.verify()
+    item.guard.verify()
+    if item.staging_guard is item.guard:
+        item.guard.replace(source, target)
+        return
+    os.replace(source, target)
+    item.guard.verify()
+    item.staging_guard.verify()
 
 
-def _cleanup_directories(
-    created: list[_CreatedDirectory],
-    before_rmdir: Callable[[Path], None],
-) -> list[BaseException]:
+def _truncate_open_stream(stream: BinaryIO) -> list[BaseException]:
     errors: list[BaseException] = []
-    for item in reversed(created):
-        try:
-            before_rmdir(item.path)
-            if item.identity is None:
-                raise StaleSyncPlanError(
-                    f"created directory identity was not captured; refusing cleanup: {item.path}"
-                )
-            item.identity.verify()
-            item.parent_guard.verify()
-            if item.parent_guard.descriptor is not None:
-                os.rmdir(item.path.name, dir_fd=item.parent_guard.descriptor)
-            else:
-                item.path.rmdir()
-            item.parent_guard.verify()
-        except FileNotFoundError:
-            pass
-        except (OSError, StaleSyncPlanError) as error:
-            errors.append(error)
-        errors.extend(_close_guard(item.parent_guard))
+    try:
+        stream.seek(0)
+        stream.truncate(0)
+        stream.flush()
+        os.fsync(stream.fileno())
+    except (OSError, ValueError) as error:
+        errors.append(error)
     return errors
 
 

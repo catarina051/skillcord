@@ -17,7 +17,9 @@ from skillcord.models.config import (
 from skillcord.models.provider import SkillRecord
 from skillcord.sync.planner import (
     OwnedFileConflictError,
+    PlannedFileChange,
     SyncContext,
+    SyncPlan,
     SyncPlanner,
     UnresolvedConflictError,
     UnsafeTargetPathError,
@@ -148,6 +150,39 @@ def test_diff_escapes_bidi_format_controls(tmp_path: Path) -> None:
     assert diff.startswith("# Control-byte diff uses unambiguous \\xNN escapes; ")
     assert "visible\\xe2\\x80\\xaereordered" in diff
     assert "\u202e" not in diff
+
+
+def test_diff_escapes_format_controls_in_artifact_path_headers(tmp_path: Path) -> None:
+    diff = SyncPlanner().plan(
+        _context(
+            tmp_path,
+            adapters=(_OwnedFileAdapter(path=Path("visible\u202ereordered.json")),),
+        )
+    ).diff_text()
+
+    assert diff.startswith("# Diff path bytes use unambiguous \\xNN escapes; ")
+    assert "b/visible\\xe2\\x80\\xaereordered.json" in diff
+    assert "\u202e" not in diff
+
+
+def test_diff_escapes_newlines_inside_artifact_path_headers(tmp_path: Path) -> None:
+    plan = SyncPlan(
+        project_root=tmp_path,
+        changes=(
+            PlannedFileChange(
+                path=tmp_path / "unused",
+                relative_path=Path("line\nbreak.json"),
+                ownership="owned_file",
+                before=None,
+                after=b"{}\n",
+            ),
+        ),
+    )
+
+    diff = plan.diff_text()
+
+    assert "+++ b/line\\x0abreak.json\n" in diff
+    assert "+++ b/line\nbreak.json" not in diff
 
 
 def test_plan_removes_only_managed_humanizer_policy(tmp_path: Path) -> None:

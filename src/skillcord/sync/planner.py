@@ -77,8 +77,10 @@ class SyncPlan:
 
         rendered: list[bytes] = []
         unsafe_kind: str | None = None
+        escaped_path = False
         for change in self.changes:
-            relative = change.relative_path.as_posix().encode("utf-8")
+            relative, path_was_escaped = _escape_diff_path(change.relative_path.as_posix())
+            escaped_path = escaped_path or path_was_escaped
             before = change.before or b""
             unsafe_kind = unsafe_kind or _unsafe_preview_kind(change.before, change.after)
             diff_lines = difflib.diff_bytes(
@@ -103,26 +105,50 @@ class SyncPlan:
                 )
 
         diff = b"".join(rendered)
+        path_notice = (
+            "# Diff path bytes use unambiguous \\xNN escapes; "
+            "literal backslashes are doubled.\n"
+            if escaped_path
+            else ""
+        )
         if unsafe_kind == "control":
             notice = (
                 "# Control-byte diff uses unambiguous \\xNN escapes; "
                 "literal backslashes are doubled.\n"
             )
-            return notice + _escape_diff_bytes(diff)
+            return path_notice + notice + _escape_diff_bytes(diff)
         try:
-            return diff.decode("utf-8")
+            return path_notice + diff.decode("utf-8")
         except UnicodeDecodeError:
             notice = (
                 "# Non-UTF-8 diff bytes use unambiguous \\xNN escapes; "
                 "literal backslashes are doubled.\n"
             )
-            return notice + _escape_diff_bytes(diff)
+            return path_notice + notice + _escape_diff_bytes(diff)
 
 
-def _unsafe_preview_kind(before: bytes | None, after: bytes) -> str | None:
+def _escape_diff_path(relative_path: str) -> tuple[bytes, bool]:
+    """Escape path controls separately from structural unified-diff newlines."""
+
+    escaped: list[bytes] = []
+    changed = False
+    for character in relative_path:
+        encoded = character.encode("utf-8")
+        if character == "\\":
+            escaped.append(b"\\\\")
+            changed = True
+        elif unicodedata.category(character) in {"Cc", "Cf"}:
+            escaped.append("".join(f"\\x{value:02x}" for value in encoded).encode("ascii"))
+            changed = True
+        else:
+            escaped.append(encoded)
+    return b"".join(escaped), changed
+
+
+def _unsafe_preview_kind(*contents: bytes | None) -> str | None:
     """Classify content that cannot be placed raw in a safe text preview."""
 
-    for content in (before, after):
+    for content in contents:
         if content is None:
             continue
         try:
