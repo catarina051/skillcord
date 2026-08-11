@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
+import skillcord.sync.applier as applier_module
 from skillcord.adapters.base import AdapterContext, GeneratedArtifact
 from skillcord.models.config import AIConfig, OverrideConfig, ProjectConfig, ProjectInfo
-from skillcord.sync.applier import StaleSyncPlanError, SyncApplier
+from skillcord.sync.applier import StaleSyncPlanError, SyncApplier, SyncRollbackError
 from skillcord.sync.planner import SyncContext, SyncPlanner
 
 
@@ -20,6 +21,25 @@ class _StaticAdapter:
                 ownership="owned_file",
                 content=b"generated\n",
                 source_capability_ids=(),
+            )
+        ]
+
+
+class _MultiFileAdapter:
+    harness_id = "multi"
+
+    def plan(self, context: AdapterContext) -> list[GeneratedArtifact]:
+        return [
+            GeneratedArtifact(
+                path=Path(name),
+                ownership="owned_file",
+                content=content,
+                source_capability_ids=(),
+            )
+            for name, content in (
+                ("a-existing.txt", b"new a\n"),
+                ("b-new.txt", b"new b\n"),
+                ("c-fail.txt", b"new c\n"),
             )
         ]
 
@@ -39,6 +59,31 @@ def _plan(tmp_path: Path):
             project_root=tmp_path,
             adapter_context=adapter_context,
             adapters=(_StaticAdapter(),),
+        )
+    )
+
+
+def _multi_plan(tmp_path: Path):
+    (tmp_path / "a-existing.txt").write_bytes(b"old a\n")
+    (tmp_path / "c-fail.txt").write_bytes(b"old c\n")
+    adapter_context = AdapterContext(
+        project=ProjectConfig(
+            schema_version=1,
+            project=ProjectInfo(intent="api"),
+            ai=AIConfig(),
+        ),
+        active_skills=(),
+        decisions=OverrideConfig(schema_version=1),
+    )
+    return SyncPlanner().plan(
+        SyncContext(
+            project_root=tmp_path,
+            adapter_context=adapter_context,
+            adapters=(_MultiFileAdapter(),),
+            owned_file_baselines={
+                Path("a-existing.txt"): b"old a\n",
+                Path("c-fail.txt"): b"old c\n",
+            },
         )
     )
 
@@ -93,19 +138,419 @@ def test_apply_rechecks_staleness_after_staging(
 ) -> None:
     plan = _plan(tmp_path)
     target = tmp_path / "nested" / "generated.txt"
-    original_mkstemp = tempfile.mkstemp
 
-    def change_target_after_staging(*args: object, **kwargs: object) -> tuple[int, str]:
-        result = original_mkstemp(*args, **kwargs)
+    def change_target_after_staging(_target: Path) -> None:
         target.write_bytes(b"changed during staging\n")
-        return result
 
-    monkeypatch.setattr(tempfile, "mkstemp", change_target_after_staging)
+    monkeypatch.setattr(
+        SyncApplier,
+        "_after_stage",
+        staticmethod(change_target_after_staging),
+        raising=False,
+    )
 
     with pytest.raises(StaleSyncPlanError, match="generated.txt"):
         SyncApplier().apply(plan, approved=True)
 
     assert target.read_bytes() == b"changed during staging\n"
+
+
+def test_apply_rejects_parent_swap_before_temp_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(tmp_path)
+    moved_outside_root = tmp_path.parent / f"{tmp_path.name}-stage-parent"
+
+    def move_parent_outside(_target: Path) -> None:
+        parent = tmp_path / "nested"
+        parent.rename(moved_outside_root)
+        parent.mkdir()
+
+    monkeypatch.setattr(
+        SyncApplier,
+        "_before_stage",
+        staticmethod(move_parent_outside),
+        raising=False,
+    )
+
+    with pytest.raises(StaleSyncPlanError, match="parent directory changed"):
+        SyncApplier().apply(plan, approved=True)
+
+    assert list(moved_outside_root.iterdir()) == []
+    assert list((tmp_path / "nested").iterdir()) == []
+
+
+def test_apply_rejects_project_root_swap_before_parent_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(tmp_path)
+    moved_outside_root = tmp_path.parent / f"{tmp_path.name}-mkdir-root"
+
+    def move_root_before_mkdir(_directory: Path) -> None:
+        tmp_path.rename(moved_outside_root)
+        tmp_path.mkdir()
+
+    monkeypatch.setattr(
+        SyncApplier,
+        "_before_mkdir",
+        staticmethod(move_root_before_mkdir),
+        raising=False,
+    )
+
+    try:
+        with pytest.raises(StaleSyncPlanError, match="parent directory changed"):
+            SyncApplier().apply(plan, approved=True)
+
+        assert not (moved_outside_root / "nested").exists()
+        assert not (tmp_path / "nested").exists()
+    finally:
+        if moved_outside_root.exists():
+            tmp_path.rmdir()
+            moved_outside_root.rename(tmp_path)
+
+
+def test_posix_dirfd_capability_uses_rename_support_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        os,
+        "supports_dir_fd",
+        {os.rename, os.open, os.unlink, os.mkdir, os.rmdir},
+    )
+    monkeypatch.setattr(os, "O_DIRECTORY", 0, raising=False)
+    monkeypatch.setattr(os, "O_NOFOLLOW", 0, raising=False)
+    monkeypatch.setattr(os, "fchmod", lambda _descriptor, _mode: None, raising=False)
+
+    assert applier_module._directory_relative_operations_supported() is True
+
+
+def test_apply_uses_anchored_directory_relative_operations_when_supported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(tmp_path)
+    real_open = os.open
+    real_fstat = os.fstat
+    real_close = os.close
+    real_replace = os.replace
+    real_unlink = os.unlink
+    real_mkdir = os.mkdir
+    directory_handles: dict[int, Path] = {}
+    next_handle = iter(range(100_000, 101_000))
+    anchored_replacements: list[tuple[Path, Path]] = []
+
+    def resolved(path: object, dir_fd: int | None) -> Path:
+        candidate = Path(os.fspath(path))
+        return directory_handles[dir_fd] / candidate if dir_fd is not None else candidate
+
+    def fake_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        target = resolved(path, dir_fd)
+        if target.is_dir():
+            handle = next(next_handle)
+            directory_handles[handle] = target
+            return handle
+        return real_open(target, flags, mode)
+
+    def fake_fstat(descriptor: int) -> os.stat_result:
+        if descriptor in directory_handles:
+            return directory_handles[descriptor].stat()
+        return real_fstat(descriptor)
+
+    def fake_close(descriptor: int) -> None:
+        if descriptor in directory_handles:
+            del directory_handles[descriptor]
+            return
+        real_close(descriptor)
+
+    def fake_replace(
+        source: object,
+        target: object,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        source_path = resolved(source, src_dir_fd)
+        target_path = resolved(target, dst_dir_fd)
+        anchored_replacements.append((source_path, target_path))
+        real_replace(source_path, target_path)
+
+    def fake_unlink(
+        path: object,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        real_unlink(resolved(path, dir_fd))
+
+    def fake_mkdir(
+        path: object,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> None:
+        real_mkdir(resolved(path, dir_fd), mode)
+
+    monkeypatch.setattr(applier_module, "_directory_relative_operations_supported", lambda: True)
+    monkeypatch.setattr(os, "open", fake_open)
+    monkeypatch.setattr(os, "fstat", fake_fstat)
+    monkeypatch.setattr(os, "close", fake_close)
+    monkeypatch.setattr(os, "replace", fake_replace)
+    monkeypatch.setattr(os, "unlink", fake_unlink)
+    monkeypatch.setattr(os, "mkdir", fake_mkdir)
+    monkeypatch.setattr(os, "fchmod", lambda _descriptor, _mode: None, raising=False)
+    monkeypatch.setattr(os, "O_DIRECTORY", 0, raising=False)
+    monkeypatch.setattr(os, "O_NOFOLLOW", 0, raising=False)
+
+    result = SyncApplier().apply(plan, approved=True)
+
+    assert result.applied is True
+    assert (tmp_path / "nested" / "generated.txt").read_bytes() == b"generated\n"
+    assert len(anchored_replacements) == 1
+    assert anchored_replacements[0][0].parent == tmp_path / "nested"
+    assert anchored_replacements[0][0].name.endswith(".skillcord.tmp")
+    assert anchored_replacements[0][1] == tmp_path / "nested" / "generated.txt"
+    assert directory_handles == {}
+
+
+def test_apply_rejects_parent_identity_swap_before_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(tmp_path)
+    moved_outside_root = tmp_path.parent / f"{tmp_path.name}-moved-parent"
+
+    def move_parent_outside(_target: Path) -> None:
+        parent = tmp_path / "nested"
+        parent.rename(moved_outside_root)
+        parent.mkdir()
+
+    monkeypatch.setattr(SyncApplier, "_before_replace", staticmethod(move_parent_outside), raising=False)
+
+    with pytest.raises(StaleSyncPlanError, match="parent directory changed"):
+        SyncApplier().apply(plan, approved=True)
+
+    assert not (tmp_path / "nested" / "generated.txt").exists()
+    assert not (moved_outside_root / "generated.txt").exists()
+
+
+def test_later_replace_failure_rolls_back_all_changes_and_plan_is_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _multi_plan(tmp_path)
+    original_replace = os.replace
+
+    def fail_last_replace(src: object, dst: object, *args: object, **kwargs: object) -> None:
+        if Path(os.fspath(dst)).name == "c-fail.txt":
+            raise OSError("injected later replace failure")
+        original_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", fail_last_replace)
+
+    with pytest.raises(OSError, match="injected later replace failure"):
+        SyncApplier().apply(plan, approved=True)
+
+    assert (tmp_path / "a-existing.txt").read_bytes() == b"old a\n"
+    assert not (tmp_path / "b-new.txt").exists()
+    assert (tmp_path / "c-fail.txt").read_bytes() == b"old c\n"
+
+    monkeypatch.undo()
+    result = SyncApplier().apply(plan, approved=True)
+    assert result.applied is True
+    assert (tmp_path / "a-existing.txt").read_bytes() == b"new a\n"
+    assert (tmp_path / "b-new.txt").read_bytes() == b"new b\n"
+    assert (tmp_path / "c-fail.txt").read_bytes() == b"new c\n"
+
+
+def test_rollback_failure_reports_original_and_rollback_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _multi_plan(tmp_path)
+    original_replace = os.replace
+    destination_counts: dict[str, int] = {}
+
+    def fail_apply_and_rollback(
+        src: object,
+        dst: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        name = Path(os.fspath(dst)).name
+        destination_counts[name] = destination_counts.get(name, 0) + 1
+        if name == "c-fail.txt":
+            raise OSError("original apply failure")
+        if name == "a-existing.txt" and destination_counts[name] == 2:
+            raise OSError("rollback restore failure")
+        original_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "replace", fail_apply_and_rollback)
+
+    with pytest.raises(SyncRollbackError) as raised:
+        SyncApplier().apply(plan, approved=True)
+
+    assert "original apply failure" in str(raised.value.original_error)
+    assert any("rollback restore failure" in str(error) for error in raised.value.rollback_errors)
+
+
+def test_staging_failure_removes_created_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(tmp_path)
+
+    def fail_fsync(_descriptor: int) -> None:
+        raise OSError("originating staging failure")
+
+    monkeypatch.setattr(os, "fsync", fail_fsync)
+
+    with pytest.raises(OSError, match="originating staging failure"):
+        SyncApplier().apply(plan, approved=True)
+
+    assert not (tmp_path / "nested").exists()
+
+
+def test_post_creation_failure_still_cleans_recorded_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(tmp_path)
+
+    def fail_after_mkdir(_directory: Path) -> None:
+        raise OSError("injected post-creation failure")
+
+    monkeypatch.setattr(
+        SyncApplier,
+        "_after_mkdir",
+        staticmethod(fail_after_mkdir),
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match="injected post-creation failure"):
+        SyncApplier().apply(plan, approved=True)
+
+    assert not (tmp_path / "nested").exists()
+
+
+def test_fallback_detects_parent_swap_before_writing_staged_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(tmp_path)
+    original_mkstemp = tempfile.mkstemp
+    original_verify = applier_module._ParentGuard.verify
+    staged_path: Path | None = None
+    reject_parent = False
+
+    def swap_after_temp_creation(*args: object, **kwargs: object) -> tuple[int, str]:
+        nonlocal reject_parent, staged_path
+        descriptor, temporary_name = original_mkstemp(*args, **kwargs)
+        staged_path = Path(temporary_name)
+        reject_parent = True
+        return descriptor, temporary_name
+
+    def reject_changed_parent(guard: applier_module._ParentGuard) -> None:
+        if reject_parent:
+            raise StaleSyncPlanError("parent directory changed: simulated swap")
+        original_verify(guard)
+
+    monkeypatch.setattr(tempfile, "mkstemp", swap_after_temp_creation)
+    monkeypatch.setattr(applier_module._ParentGuard, "verify", reject_changed_parent)
+
+    with pytest.raises(StaleSyncPlanError, match="parent directory changed"):
+        SyncApplier().apply(plan, approved=True)
+
+    assert staged_path is not None
+    assert staged_path.read_bytes() == b""
+    assert not (tmp_path / "nested" / "generated.txt").exists()
+
+
+def test_cleanup_failure_does_not_mask_staging_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(tmp_path)
+    original_unlink = os.unlink
+
+    def fail_fsync(_descriptor: int) -> None:
+        raise OSError("originating staging failure")
+
+    def fail_temp_cleanup(path: object, *args: object, **kwargs: object) -> None:
+        if ".skillcord.tmp" in os.fspath(path):
+            raise OSError("secondary cleanup failure")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "fsync", fail_fsync)
+    monkeypatch.setattr(os, "unlink", fail_temp_cleanup)
+
+    with pytest.raises(OSError, match="originating staging failure") as raised:
+        SyncApplier().apply(plan, approved=True)
+
+    assert any("secondary cleanup failure" in note for note in raised.value.__notes__)
+
+
+def test_cleanup_rejects_parent_redirection_before_directory_removal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(tmp_path)
+    moved_outside_root = tmp_path.parent / f"{tmp_path.name}-cleanup-root"
+
+    def fail_fsync(_descriptor: int) -> None:
+        raise OSError("originating staging failure")
+
+    def redirect_cleanup(_directory: Path) -> None:
+        tmp_path.rename(moved_outside_root)
+        tmp_path.mkdir()
+        (tmp_path / "nested").mkdir()
+
+    monkeypatch.setattr(os, "fsync", fail_fsync)
+    monkeypatch.setattr(
+        SyncApplier,
+        "_before_rmdir",
+        staticmethod(redirect_cleanup),
+        raising=False,
+    )
+
+    try:
+        with pytest.raises(OSError, match="originating staging failure") as raised:
+            SyncApplier().apply(plan, approved=True)
+
+        assert (tmp_path / "nested").is_dir()
+        assert (moved_outside_root / "nested").is_dir()
+        assert any("parent directory changed" in note for note in raised.value.__notes__)
+    finally:
+        if moved_outside_root.exists():
+            (tmp_path / "nested").rmdir()
+            tmp_path.rmdir()
+            moved_outside_root.rename(tmp_path)
+
+
+def test_success_reports_guard_cleanup_errors_separately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(tmp_path)
+    original_close = applier_module._ParentGuard.close
+
+    def close_then_fail(guard: applier_module._ParentGuard) -> None:
+        original_close(guard)
+        raise OSError("injected guard cleanup failure")
+
+    monkeypatch.setattr(applier_module._ParentGuard, "close", close_then_fail)
+
+    result = SyncApplier().apply(plan, approved=True)
+
+    assert result.applied is True
+    assert result.cleanup_errors
+    assert set(result.cleanup_errors) == {"injected guard cleanup failure"}
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not portable to Windows")

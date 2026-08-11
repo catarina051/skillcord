@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -75,9 +76,11 @@ class SyncPlan:
         """Return deterministic unified diffs for every planned byte change."""
 
         rendered: list[bytes] = []
+        unsafe_kind: str | None = None
         for change in self.changes:
             relative = change.relative_path.as_posix().encode("utf-8")
             before = change.before or b""
+            unsafe_kind = unsafe_kind or _unsafe_preview_kind(change.before, change.after)
             diff_lines = difflib.diff_bytes(
                 difflib.unified_diff,
                 before.splitlines(keepends=True),
@@ -89,8 +92,23 @@ class SyncPlan:
                 rendered.append(line)
                 if not line.endswith((b"\r", b"\n")):
                     rendered.extend((b"\n", b"\\ No newline at end of file\n"))
+            if change.before is None and change.after == b"":
+                rendered.extend(
+                    (
+                        b"--- /dev/null\n",
+                        b"+++ b/" + relative + b"\n",
+                        b"@@ -0,0 +0,0 @@\n",
+                        b"\\ Empty file created\n",
+                    )
+                )
 
         diff = b"".join(rendered)
+        if unsafe_kind == "control":
+            notice = (
+                "# Control-byte diff uses unambiguous \\xNN escapes; "
+                "literal backslashes are doubled.\n"
+            )
+            return notice + _escape_diff_bytes(diff)
         try:
             return diff.decode("utf-8")
         except UnicodeDecodeError:
@@ -99,6 +117,24 @@ class SyncPlan:
                 "literal backslashes are doubled.\n"
             )
             return notice + _escape_diff_bytes(diff)
+
+
+def _unsafe_preview_kind(before: bytes | None, after: bytes) -> str | None:
+    """Classify content that cannot be placed raw in a safe text preview."""
+
+    for content in (before, after):
+        if content is None:
+            continue
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            return "invalid_utf8"
+        if any(
+            unicodedata.category(character) in {"Cc", "Cf"} and character not in "\t\r\n"
+            for character in text
+        ):
+            return "control"
+    return None
 
 
 def _escape_diff_bytes(diff: bytes) -> str:

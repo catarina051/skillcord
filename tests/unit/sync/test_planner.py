@@ -115,6 +115,41 @@ def test_diff_escapes_invalid_utf8_without_ambiguity(tmp_path: Path) -> None:
     assert "literal \\\\xff and byte \\xff" in diff
 
 
+def test_diff_previews_creation_of_empty_owned_file(tmp_path: Path) -> None:
+    diff = SyncPlanner().plan(
+        _context(tmp_path, adapters=(_OwnedFileAdapter(content=b""),))
+    ).diff_text()
+
+    assert diff == (
+        "--- /dev/null\n"
+        "+++ b/generated.json\n"
+        "@@ -0,0 +0,0 @@\n"
+        "\\ Empty file created\n"
+    )
+
+
+def test_diff_escapes_valid_utf8_control_bytes_without_raw_nul(tmp_path: Path) -> None:
+    agents = tmp_path / "AGENTS.md"
+    agents.write_bytes(b"user NUL: \x00\n")
+
+    diff = SyncPlanner().plan(_context(tmp_path)).diff_text()
+
+    assert diff.startswith("# Control-byte diff uses unambiguous \\xNN escapes; ")
+    assert "user NUL: \\x00" in diff
+    assert "\x00" not in diff
+
+
+def test_diff_escapes_bidi_format_controls(tmp_path: Path) -> None:
+    agents = tmp_path / "AGENTS.md"
+    agents.write_text("visible\u202ereordered\n", encoding="utf-8")
+
+    diff = SyncPlanner().plan(_context(tmp_path)).diff_text()
+
+    assert diff.startswith("# Control-byte diff uses unambiguous \\xNN escapes; ")
+    assert "visible\\xe2\\x80\\xaereordered" in diff
+    assert "\u202e" not in diff
+
+
 def test_plan_removes_only_managed_humanizer_policy(tmp_path: Path) -> None:
     provider_skill = tmp_path / "providers" / "humanizer" / "humanizer" / "SKILL.md"
     provider_skill.parent.mkdir(parents=True)
@@ -168,15 +203,20 @@ def test_noninteractive_plan_fails_on_missing_override_id(tmp_path: Path) -> Non
 class _OwnedFileAdapter:
     harness_id = "owned"
 
-    def __init__(self, path: Path = Path("generated.json")) -> None:
+    def __init__(
+        self,
+        path: Path = Path("generated.json"),
+        content: bytes = b'{"generated": true}\n',
+    ) -> None:
         self.path = path
+        self.content = content
 
     def plan(self, context: AdapterContext) -> list[GeneratedArtifact]:
         return [
             GeneratedArtifact(
                 path=self.path,
                 ownership="owned_file",
-                content=b'{"generated": true}\n',
+                content=self.content,
                 source_capability_ids=(),
             )
         ]
