@@ -32,6 +32,13 @@ class ProviderComponent(BaseModel):
     source_path: Path
     source_revision: str | None = None
     updater_can_mutate: bool = False
+    artifact_hashes: dict[Path, str] = Field(default_factory=dict)
+
+    @property
+    def revision(self) -> str | None:
+        """Return the optional immutable source revision for compatibility."""
+
+        return self.source_revision
 
 
 class ProviderSnapshot(BaseModel):
