@@ -42,3 +42,19 @@ def test_git_revision_resolver_returns_none_outside_git_repository(tmp_path: Pat
     source.mkdir()
 
     assert GitRevisionResolver().resolve(source) is None
+
+
+def test_git_revision_resolver_supports_linked_worktree(
+    tmp_git_repo: Path, tmp_path: Path
+) -> None:
+    linked_worktree = tmp_path / "linked-provider"
+    subprocess.run(
+        ["git", "worktree", "add", "--quiet", "-b", "linked-provider", str(linked_worktree)],
+        cwd=tmp_git_repo,
+        check=True,
+    )
+
+    root_revision = GitRevisionResolver().resolve(tmp_git_repo)
+
+    assert root_revision is not None
+    assert GitRevisionResolver().resolve(linked_worktree) == root_revision
