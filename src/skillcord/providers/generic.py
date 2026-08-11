@@ -12,6 +12,34 @@ from skillcord.normalization.ids import normalize_token
 from skillcord.providers.base import ProviderDiscoveryError
 
 
+class _NoDuplicateKeySafeLoader(yaml.SafeLoader):  # type: ignore[misc]
+    """Safe YAML loader that rejects ambiguous mapping keys."""
+
+
+def _construct_mapping_without_duplicates(
+    loader: _NoDuplicateKeySafeLoader, node: Any, deep: bool = False
+) -> dict[Any, Any]:
+    loader.flatten_mapping(node)
+    mapping: dict[Any, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key ({key!r})",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_NoDuplicateKeySafeLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_mapping_without_duplicates,
+)
+
+
 class GenericSkillAdapter:
     """Discover one explicitly located generic ``SKILL.md`` file."""
 
@@ -85,7 +113,7 @@ class GenericSkillAdapter:
             raise ProviderDiscoveryError(self.provider_id, skill_path, "unterminated YAML frontmatter")
 
         try:
-            document = yaml.safe_load("".join(lines[1:closing_index]))
+            document = yaml.load("".join(lines[1:closing_index]), Loader=_NoDuplicateKeySafeLoader)
         except yaml.YAMLError as error:
             raise ProviderDiscoveryError(self.provider_id, skill_path, "malformed YAML frontmatter") from error
         if not isinstance(document, Mapping):
@@ -110,4 +138,14 @@ class GenericSkillAdapter:
         value = metadata.get(key, [])
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             raise ProviderDiscoveryError(self.provider_id, path, f"frontmatter {key!r} must be a list of strings")
-        return {normalize_token(item) for item in value if normalize_token(item)}
+        tokens: set[str] = set()
+        for item in value:
+            token = normalize_token(item)
+            if not token:
+                raise ProviderDiscoveryError(
+                    self.provider_id,
+                    path,
+                    f"frontmatter {key!r} contains a value that normalizes to empty",
+                )
+            tokens.add(token)
+        return tokens

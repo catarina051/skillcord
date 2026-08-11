@@ -35,3 +35,34 @@ def test_generic_adapter_rejects_malformed_frontmatter(tmp_path: Path) -> None:
 
     with pytest.raises(ProviderDiscoveryError):
         GenericSkillAdapter(provider_id="generic").discover(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "frontmatter",
+    [
+        "name: Valid\nname: Other",
+        "name: Valid\ncapabilities:\n  - first\ncapabilities:\n  - second",
+        "name: Valid\nharnesses:\n  - first\nharnesses:\n  - second",
+    ],
+)
+def test_generic_adapter_rejects_duplicate_frontmatter_keys(tmp_path: Path, frontmatter: str) -> None:
+    (tmp_path / "SKILL.md").write_text(
+        f"---\n{frontmatter}\n---\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ProviderDiscoveryError):
+        GenericSkillAdapter(provider_id="generic").discover(tmp_path)
+
+
+@pytest.mark.parametrize("field", ["capabilities", "harnesses"])
+def test_generic_adapter_rejects_list_members_without_normalized_tokens(
+    tmp_path: Path, field: str
+) -> None:
+    (tmp_path / "SKILL.md").write_text(
+        f"---\nname: Valid\n{field}:\n  - '!!!'\n---\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ProviderDiscoveryError):
+        GenericSkillAdapter(provider_id="generic").discover(tmp_path)
