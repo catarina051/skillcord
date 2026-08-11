@@ -10,7 +10,7 @@ from skillcord.providers.generic import GenericSkillAdapter
 class OpenDesignAdapter:
     """Discover known Open Design skill artifacts without managing its runtime."""
 
-    provider_id = "open-design"
+    provider_id = "open_design"
 
     def __init__(self) -> None:
         self._skill_adapter = GenericSkillAdapter(provider_id=self.provider_id)

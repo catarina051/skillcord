@@ -9,7 +9,7 @@ from skillcord.providers.open_design import OpenDesignAdapter
 def test_open_design_discovers_declarative_skills_only() -> None:
     snapshot = OpenDesignAdapter().discover(Path("tests/fixtures/providers/open_design"))
 
-    assert [skill.normalized_id for skill in snapshot.skills] == ["open-design.ui-design"]
+    assert [skill.normalized_id for skill in snapshot.skills] == ["open_design.ui-design"]
     assert snapshot.runtime_requirements == {"mcp": "external", "daemon": "external"}
 
 
@@ -23,7 +23,7 @@ def test_open_design_ignores_unknown_skill_locations(tmp_path: Path) -> None:
 
     snapshot = OpenDesignAdapter().discover(tmp_path)
 
-    assert [skill.normalized_id for skill in snapshot.skills] == ["open-design.kept"]
+    assert [skill.normalized_id for skill in snapshot.skills] == ["open_design.kept"]
 
 
 def test_open_design_discovery_does_not_execute_subprocesses(monkeypatch) -> None:
