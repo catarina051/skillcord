@@ -10,6 +10,7 @@ detected late swap is treated as an apply failure and rollback is attempted.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import secrets
 import stat
@@ -206,10 +207,34 @@ class _StagedChange:
     change: PlannedFileChange
     guard: _ParentGuard
     staging_guard: _ParentGuard
-    replacement: Path
-    backup: Path | None
+    replacement: _StagedEntry
+    backup: _StagedEntry | None
     replacement_consumed: bool = False
     backup_consumed: bool = False
+
+
+@dataclass(frozen=True)
+class _FileIdentity:
+    device: int
+    inode: int
+    file_type: int
+
+    @classmethod
+    def from_stat(cls, metadata: os.stat_result) -> _FileIdentity:
+        return cls(
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+            file_type=stat.S_IFMT(metadata.st_mode),
+        )
+
+
+@dataclass(frozen=True)
+class _StagedEntry:
+    path: Path
+    identity: _FileIdentity
+    size: int
+    mode: int
+    content_hash: bytes
 
 
 class SyncApplier:
@@ -242,7 +267,7 @@ class SyncApplier:
                         suffix=".skillcord.tmp",
                         after_write=self._after_stage_write,
                     )
-                    backup: Path | None = None
+                    backup: _StagedEntry | None = None
                     try:
                         self._after_stage(change.path)
                         if change.before is not None:
@@ -258,7 +283,7 @@ class SyncApplier:
                         _add_error_notes(
                             error,
                             "cleanup",
-                            _cleanup_paths(staging_guard, [replacement]),
+                            _cleanup_entries(staging_guard, [replacement]),
                         )
                         raise
                 except BaseException as error:
@@ -360,6 +385,19 @@ class SyncApplier:
     @staticmethod
     def _validate_staged_change(item: _StagedChange) -> None:
         item.staging_guard.verify()
+        _verify_entry_at(
+            item.staging_guard,
+            item.replacement.path,
+            item.replacement,
+            trusted=False,
+        )
+        if item.backup is not None:
+            _verify_entry_at(
+                item.staging_guard,
+                item.backup.path,
+                item.backup,
+                trusted=False,
+            )
         current = item.guard.current_bytes(item.change.path)
         if current != item.change.before:
             raise StaleSyncPlanError(
@@ -371,7 +409,12 @@ class SyncApplier:
         errors: list[BaseException] = []
         for item in reversed(applied):
             try:
-                current = item.guard.current_bytes(item.change.path)
+                trusted_parent = item.guard.descriptor is not None
+                current = _current_bytes(
+                    item.guard,
+                    item.change.path,
+                    trusted=trusted_parent,
+                )
                 if current == item.change.before:
                     continue
                 if current != item.change.after:
@@ -380,11 +423,27 @@ class SyncApplier:
                         f"{item.change.relative_path.as_posix()}"
                     )
                 if item.change.before is None:
-                    item.guard.unlink(item.change.path, missing_ok=False)
+                    _verify_entry_at(
+                        item.guard,
+                        item.change.path,
+                        item.replacement,
+                        trusted=trusted_parent,
+                        label="installed file changed; refusing rollback",
+                    )
+                    if trusted_parent:
+                        item.guard.unlink_staged(item.change.path, missing_ok=False)
+                    else:
+                        item.guard.unlink(item.change.path, missing_ok=False)
                 else:
                     if item.backup is None:
                         raise RuntimeError("missing rollback backup for existing file")
-                    _replace_staged(item, item.backup, item.change.path)
+                    _replace_staged(
+                        item,
+                        item.backup,
+                        item.change.path,
+                        trusted_parent=trusted_parent,
+                        expected_target=item.replacement,
+                    )
                     item.backup_consumed = True
             except (OSError, RuntimeError) as error:
                 errors.append(error)
@@ -433,7 +492,7 @@ def _stage_bytes(
     *,
     suffix: str,
     after_write: Callable[[Path], None],
-) -> Path:
+) -> _StagedEntry:
     guard.verify()
     if guard.descriptor is not None:
         descriptor, temporary = _open_anchored_temporary(guard, target, suffix)
@@ -444,6 +503,7 @@ def _stage_bytes(
             dir=guard.parent,
         )
         temporary = Path(temporary_name)
+    created_identity = _FileIdentity.from_stat(os.fstat(descriptor))
     try:
         with os.fdopen(descriptor, "wb") as stream:
             try:
@@ -458,12 +518,24 @@ def _stage_bytes(
                     descriptor_chmod(stream.fileno(), mode)
                 after_write(temporary)
                 guard.verify()
+                metadata = os.fstat(stream.fileno())
+                entry = _StagedEntry(
+                    path=temporary,
+                    identity=_FileIdentity.from_stat(metadata),
+                    size=metadata.st_size,
+                    mode=stat.S_IMODE(metadata.st_mode),
+                    content_hash=hashlib.sha256(content).digest(),
+                )
             except BaseException as error:
                 _add_error_notes(error, "payload scrub", _truncate_open_stream(stream))
                 raise
-        return temporary
+        return entry
     except BaseException as error:
-        _add_error_notes(error, "cleanup", _cleanup_paths(guard, [temporary]))
+        _add_error_notes(
+            error,
+            "cleanup",
+            _cleanup_owned_path(guard, temporary, created_identity),
+        )
         raise
 
 
@@ -490,12 +562,127 @@ def _open_anchored_temporary(
     raise FileExistsError("could not allocate a unique Skillcord temporary file")
 
 
-def _cleanup_paths(guard: _ParentGuard, paths: list[Path]) -> list[BaseException]:
+def _observe_file(
+    guard: _ParentGuard,
+    path: Path,
+    *,
+    trusted: bool,
+) -> tuple[_FileIdentity, int, int, bytes]:
+    if not trusted:
+        guard.verify()
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    path_metadata: os.stat_result | None = None
+    if guard.descriptor is not None:
+        descriptor = os.open(path.name, flags, dir_fd=guard.descriptor)
+    else:
+        path_metadata = path.lstat()
+        if stat.S_ISLNK(path_metadata.st_mode):
+            raise StaleSyncPlanError(f"staged file changed: {path}")
+        descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise StaleSyncPlanError(f"staged file changed: {path}")
+        if path_metadata is not None and _FileIdentity.from_stat(path_metadata) != (
+            _FileIdentity.from_stat(metadata)
+        ):
+            raise StaleSyncPlanError(f"staged file changed: {path}")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            content_hash = hashlib.sha256(stream.read()).digest()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if not trusted:
+        guard.verify()
+    return (
+        _FileIdentity.from_stat(metadata),
+        metadata.st_size,
+        stat.S_IMODE(metadata.st_mode),
+        content_hash,
+    )
+
+
+def _verify_entry_at(
+    guard: _ParentGuard,
+    path: Path,
+    expected: _StagedEntry,
+    *,
+    trusted: bool,
+    label: str = "staged file changed",
+) -> None:
+    try:
+        observed = _observe_file(guard, path, trusted=trusted)
+    except FileNotFoundError as error:
+        raise StaleSyncPlanError(f"{label}: {path}") from error
+    expected_values = (
+        expected.identity,
+        expected.size,
+        expected.mode,
+        expected.content_hash,
+    )
+    if observed != expected_values:
+        raise StaleSyncPlanError(f"{label}: {path}")
+
+
+def _current_bytes(guard: _ParentGuard, path: Path, *, trusted: bool) -> bytes | None:
+    if not trusted:
+        return guard.current_bytes(path)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path.name, flags, dir_fd=guard.descriptor)
+    except FileNotFoundError:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise StaleSyncPlanError(f"sync target is not a regular file: {path}")
+        with os.fdopen(descriptor, "rb") as stream:
+            descriptor = -1
+            return stream.read()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _cleanup_owned_path(
+    guard: _ParentGuard,
+    path: Path,
+    identity: _FileIdentity,
+) -> list[BaseException]:
     errors: list[BaseException] = []
-    for path in paths:
+    trusted = guard.descriptor is not None
+    try:
+        observed_identity, _size, _mode, _hash = _observe_file(
+            guard,
+            path,
+            trusted=trusted,
+        )
+        if observed_identity != identity:
+            raise StaleSyncPlanError(f"staged file changed; refusing cleanup: {path}")
+        guard.unlink_staged(path, missing_ok=True)
+    except FileNotFoundError:
+        pass
+    except (OSError, StaleSyncPlanError) as error:
+        errors.append(error)
+    return errors
+
+
+def _cleanup_entries(
+    guard: _ParentGuard,
+    entries: list[_StagedEntry],
+) -> list[BaseException]:
+    errors: list[BaseException] = []
+    trusted = guard.descriptor is not None
+    for entry in entries:
         try:
-            guard.unlink_staged(path, missing_ok=True)
+            _verify_entry_at(guard, entry.path, entry, trusted=trusted)
+            guard.unlink_staged(entry.path, missing_ok=True)
+        except FileNotFoundError:
+            pass
         except (OSError, StaleSyncPlanError) as error:
+            if isinstance(error.__cause__, FileNotFoundError):
+                continue
             errors.append(error)
     return errors
 
@@ -503,12 +690,12 @@ def _cleanup_paths(guard: _ParentGuard, paths: list[Path]) -> list[BaseException
 def _cleanup_staged(staged: list[_StagedChange]) -> list[BaseException]:
     errors: list[BaseException] = []
     for item in staged:
-        paths: list[Path] = []
+        entries: list[_StagedEntry] = []
         if not item.replacement_consumed:
-            paths.append(item.replacement)
+            entries.append(item.replacement)
         if item.backup is not None and not item.backup_consumed:
-            paths.append(item.backup)
-        errors.extend(_cleanup_paths(item.staging_guard, paths))
+            entries.append(item.backup)
+        errors.extend(_cleanup_entries(item.staging_guard, entries))
     return errors
 
 
@@ -538,15 +725,55 @@ def _close_unique_guards(guards: tuple[_ParentGuard, ...]) -> list[BaseException
     return errors
 
 
-def _replace_staged(item: _StagedChange, source: Path, target: Path) -> None:
-    item.staging_guard.verify()
-    item.guard.verify()
+def _replace_staged(
+    item: _StagedChange,
+    source: _StagedEntry,
+    target: Path,
+    *,
+    trusted_parent: bool = False,
+    expected_target: _StagedEntry | None = None,
+) -> None:
+    trusted_staging = trusted_parent and item.staging_guard.descriptor is not None
+    _verify_entry_at(
+        item.staging_guard,
+        source.path,
+        source,
+        trusted=trusted_staging,
+    )
+    if expected_target is not None:
+        _verify_entry_at(
+            item.guard,
+            target,
+            expected_target,
+            trusted=trusted_parent,
+            label="installed file changed; refusing rollback",
+        )
+    if not trusted_parent:
+        item.guard.verify()
     if item.staging_guard is item.guard:
-        item.guard.replace(source, target)
-        return
-    os.replace(source, target)
-    item.guard.verify()
-    item.staging_guard.verify()
+        if item.guard.descriptor is not None:
+            os.replace(
+                source.path.name,
+                target.name,
+                src_dir_fd=item.guard.descriptor,
+                dst_dir_fd=item.guard.descriptor,
+            )
+        else:
+            os.replace(source.path, target)
+    else:
+        os.replace(source.path, target)
+    trusted_target = trusted_parent or item.guard.descriptor is not None
+    _verify_entry_at(
+        item.guard,
+        target,
+        source,
+        trusted=trusted_target,
+        label="installed file does not match approved stage",
+    )
+    if not trusted_parent:
+        item.guard.verify()
+        if item.staging_guard is not item.guard:
+            item.staging_guard.verify()
 
 
 def _truncate_open_stream(stream: BinaryIO) -> list[BaseException]:

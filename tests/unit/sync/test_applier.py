@@ -1,3 +1,4 @@
+import hashlib
 import os
 import tempfile
 from pathlib import Path
@@ -8,7 +9,7 @@ import skillcord.sync.applier as applier_module
 from skillcord.adapters.base import AdapterContext, GeneratedArtifact
 from skillcord.models.config import AIConfig, OverrideConfig, ProjectConfig, ProjectInfo
 from skillcord.sync.applier import StaleSyncPlanError, SyncApplier, SyncRollbackError
-from skillcord.sync.planner import SyncContext, SyncPlanner
+from skillcord.sync.planner import PlannedFileChange, SyncContext, SyncPlanner
 
 
 class _StaticAdapter:
@@ -87,6 +88,17 @@ def _multi_plan(tmp_path: Path):
                 Path("c-fail.txt"): b"old c\n",
             },
         )
+    )
+
+
+def _staged_entry(path: Path) -> applier_module._StagedEntry:
+    metadata = path.stat()
+    return applier_module._StagedEntry(
+        path=path,
+        identity=applier_module._FileIdentity.from_stat(metadata),
+        size=metadata.st_size,
+        mode=metadata.st_mode & 0o7777,
+        content_hash=hashlib.sha256(path.read_bytes()).digest(),
     )
 
 
@@ -329,6 +341,127 @@ def test_apply_rejects_parent_identity_swap_before_replace(
     assert not (moved_outside_root / "generated.txt").exists()
 
 
+def test_anchored_post_replace_parent_move_rolls_back_through_retained_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "nested"
+    parent.mkdir()
+    target = parent / "generated.txt"
+    replacement = parent / ".generated.skillcord.tmp"
+    backup = parent / ".generated.skillcord.backup"
+    target.write_bytes(b"old\n")
+    replacement.write_bytes(b"generated secret\n")
+    backup.write_bytes(b"old\n")
+    moved_parent = tmp_path.parent / f"{tmp_path.name}-anchored-parent"
+    descriptor = 12345
+    real_open = os.open
+    real_fstat = os.fstat
+    real_replace = os.replace
+
+    def anchored_path(name: object) -> Path:
+        base = moved_parent if moved_parent.exists() else parent
+        return base / Path(os.fspath(name))
+
+    def fake_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if dir_fd == descriptor:
+            return real_open(anchored_path(path), flags, mode)
+        return real_open(path, flags, mode)
+
+    def fake_fstat(fd: int) -> os.stat_result:
+        if fd == descriptor:
+            return (moved_parent if moved_parent.exists() else parent).stat()
+        return real_fstat(fd)
+
+    first_replace = True
+
+    def fake_replace(
+        source: object,
+        destination: object,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
+        nonlocal first_replace
+        source_path = anchored_path(source) if src_dir_fd == descriptor else Path(source)
+        destination_path = (
+            anchored_path(destination) if dst_dir_fd == descriptor else Path(destination)
+        )
+        real_replace(source_path, destination_path)
+        if first_replace:
+            first_replace = False
+            parent.rename(moved_parent)
+            parent.mkdir()
+
+    monkeypatch.setattr(os, "open", fake_open)
+    monkeypatch.setattr(os, "fstat", fake_fstat)
+    monkeypatch.setattr(os, "replace", fake_replace)
+
+    guard = applier_module._ParentGuard(
+        root=tmp_path,
+        parent=parent,
+        identities=applier_module._capture_parent_chain(tmp_path, parent),
+        descriptor=descriptor,
+    )
+    item = applier_module._StagedChange(
+        change=PlannedFileChange(
+            path=target,
+            relative_path=Path("nested/generated.txt"),
+            ownership="owned_file",
+            before=b"old\n",
+            after=b"generated secret\n",
+        ),
+        guard=guard,
+        staging_guard=guard,
+        replacement=_staged_entry(replacement),
+        backup=_staged_entry(backup),
+    )
+
+    with pytest.raises(StaleSyncPlanError, match="parent directory changed"):
+        applier_module._replace_staged(item, item.replacement, target)
+
+    rollback_errors = SyncApplier._rollback([item])
+
+    assert rollback_errors == []
+    assert (moved_parent / "generated.txt").read_bytes() == b"old\n"
+    assert b"generated secret" not in (moved_parent / "generated.txt").read_bytes()
+    assert not target.exists()
+
+
+def test_replacement_stage_substitution_is_never_installed_or_deleted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _plan(tmp_path)
+    substituted: Path | None = None
+
+    def substitute_replacement(_target: Path) -> None:
+        nonlocal substituted
+        replacement = next(tmp_path.glob("*.skillcord.tmp"))
+        replacement.unlink()
+        replacement.write_bytes(b"attacker replacement\n")
+        substituted = replacement
+
+    monkeypatch.setattr(
+        SyncApplier,
+        "_before_replace",
+        staticmethod(substitute_replacement),
+    )
+
+    with pytest.raises(StaleSyncPlanError, match="staged file changed"):
+        SyncApplier().apply(plan, approved=True)
+
+    assert not (tmp_path / "nested" / "generated.txt").exists()
+    assert substituted is not None
+    assert substituted.read_bytes() == b"attacker replacement\n"
+
+
 def test_later_replace_failure_rolls_back_all_changes_and_plan_is_retryable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -387,6 +520,130 @@ def test_rollback_failure_reports_original_and_rollback_errors(
 
     assert "original apply failure" in str(raised.value.original_error)
     assert any("rollback restore failure" in str(error) for error in raised.value.rollback_errors)
+
+
+def test_backup_substitution_is_never_used_or_deleted_during_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _multi_plan(tmp_path)
+    substituted: Path | None = None
+
+    def substitute_backup_and_stale_last(target: Path) -> None:
+        nonlocal substituted
+        if target.name != "c-fail.txt":
+            return
+        backup = next(
+            path
+            for path in tmp_path.glob("*.skillcord.backup")
+            if path.read_bytes() == b"old a\n"
+        )
+        backup.unlink()
+        backup.write_bytes(b"attacker backup\n")
+        substituted = backup
+        target.write_bytes(b"concurrent change\n")
+
+    monkeypatch.setattr(
+        SyncApplier,
+        "_before_replace",
+        staticmethod(substitute_backup_and_stale_last),
+    )
+
+    with pytest.raises(SyncRollbackError) as raised:
+        SyncApplier().apply(plan, approved=True)
+
+    assert any("staged file changed" in str(error) for error in raised.value.rollback_errors)
+    assert (tmp_path / "a-existing.txt").read_bytes() == b"new a\n"
+    assert substituted is not None
+    assert substituted.read_bytes() == b"attacker backup\n"
+
+
+def test_same_content_installed_target_substitution_is_not_rolled_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _multi_plan(tmp_path)
+    substituted_identity: tuple[int, int] | None = None
+
+    def substitute_installed_target_and_stale_last(target: Path) -> None:
+        nonlocal substituted_identity
+        if target.name != "c-fail.txt":
+            return
+        installed = tmp_path / "a-existing.txt"
+        installed.unlink()
+        installed.write_bytes(b"new a\n")
+        metadata = installed.stat()
+        substituted_identity = (metadata.st_dev, metadata.st_ino)
+        target.write_bytes(b"concurrent change\n")
+
+    monkeypatch.setattr(
+        SyncApplier,
+        "_before_replace",
+        staticmethod(substitute_installed_target_and_stale_last),
+    )
+
+    with pytest.raises(SyncRollbackError) as raised:
+        SyncApplier().apply(plan, approved=True)
+
+    assert any("installed file changed" in str(error) for error in raised.value.rollback_errors)
+    assert (tmp_path / "a-existing.txt").read_bytes() == b"new a\n"
+    metadata = (tmp_path / "a-existing.txt").stat()
+    assert substituted_identity == (metadata.st_dev, metadata.st_ino)
+
+
+def test_restore_rechecks_target_after_backup_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan = _multi_plan(tmp_path)
+    original_verify_entry = applier_module._verify_entry_at
+    rollback_started = False
+    substituted_identity: tuple[int, int] | None = None
+
+    def stale_last_target(target: Path) -> None:
+        nonlocal rollback_started
+        if target.name == "c-fail.txt":
+            rollback_started = True
+            target.write_bytes(b"concurrent change\n")
+
+    def substitute_after_backup_verification(
+        guard: applier_module._ParentGuard,
+        path: Path,
+        expected: applier_module._StagedEntry,
+        *,
+        trusted: bool,
+        label: str = "staged file changed",
+    ) -> None:
+        nonlocal substituted_identity
+        original_verify_entry(
+            guard,
+            path,
+            expected,
+            trusted=trusted,
+            label=label,
+        )
+        if (
+            rollback_started
+            and path.name.endswith(".skillcord.backup")
+            and expected.content_hash == hashlib.sha256(b"old a\n").digest()
+            and substituted_identity is None
+        ):
+            installed = tmp_path / "a-existing.txt"
+            installed.unlink()
+            installed.write_bytes(b"new a\n")
+            metadata = installed.stat()
+            substituted_identity = (metadata.st_dev, metadata.st_ino)
+
+    monkeypatch.setattr(SyncApplier, "_before_replace", staticmethod(stale_last_target))
+    monkeypatch.setattr(applier_module, "_verify_entry_at", substitute_after_backup_verification)
+
+    with pytest.raises(SyncRollbackError) as raised:
+        SyncApplier().apply(plan, approved=True)
+
+    assert any("installed file changed" in str(error) for error in raised.value.rollback_errors)
+    assert (tmp_path / "a-existing.txt").read_bytes() == b"new a\n"
+    metadata = (tmp_path / "a-existing.txt").stat()
+    assert substituted_identity == (metadata.st_dev, metadata.st_ino)
 
 
 def test_staging_failure_removes_temporary_from_existing_directory(
@@ -513,6 +770,7 @@ def test_anchored_temp_cleanup_uses_retained_directory_descriptor(
     parent = tmp_path / "nested"
     parent.mkdir()
     temporary = parent / ".generated.secret.skillcord.tmp"
+    temporary.write_bytes(b"staged\n")
     guard = applier_module._ParentGuard(
         root=tmp_path,
         parent=parent,
@@ -529,8 +787,9 @@ def test_anchored_temp_cleanup_uses_retained_directory_descriptor(
 
     monkeypatch.setattr(guard, "verify", fail_path_verification)
     monkeypatch.setattr(os, "unlink", record_unlink)
+    monkeypatch.setattr(applier_module, "_verify_entry_at", lambda *_args, **_kwargs: None)
 
-    errors = applier_module._cleanup_paths(guard, [temporary])
+    errors = applier_module._cleanup_entries(guard, [_staged_entry(temporary)])
 
     assert errors == []
     assert unlinked == [(temporary.name, 12345)]
