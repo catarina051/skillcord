@@ -50,6 +50,13 @@ def _find_byte_block(original: bytes) -> _ByteBlock | None:
     return _ByteBlock(start=block_start, end=block_end)
 
 
+def _validate_replacement(replacement: bytes) -> None:
+    """Reject generated content that could create another managed block."""
+    for line in replacement.splitlines(keepends=True):
+        if _marker_for_line(line) is not None:
+            raise ManagedBlockError("replacement contains a Skillcord managed-block marker")
+
+
 def _detected_newline(content: bytes) -> bytes:
     """Return the first line-ending convention used by the existing content."""
     index = 0
@@ -85,6 +92,7 @@ def render_managed_update(original: bytes, replacement: bytes) -> bytes:
     after the original bytes, using the existing line convention (or LF for an
     empty file).
     """
+    _validate_replacement(replacement)
     block = _find_byte_block(original)
     newline = _detected_newline(original)
     rendered = _render_block(replacement, newline)

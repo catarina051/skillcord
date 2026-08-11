@@ -38,3 +38,12 @@ def test_parse_managed_block_reports_when_no_block_exists() -> None:
     assert state.present is False
     assert state.start is None
     assert state.end is None
+
+
+def test_parse_managed_block_accepts_marker_lines_with_spaces_and_tabs() -> None:
+    text = "prefix\n \t<!-- skillcord:begin -->\t \nmanaged\n\t<!-- skillcord:end --> \nsuffix\n"
+
+    state = parse_managed_block(text)
+
+    assert state.present is True
+    assert text[state.start : state.end].startswith(" \t<!-- skillcord:begin -->")
