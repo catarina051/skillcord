@@ -15,7 +15,36 @@ from skillcord.adapters.base import (
 from skillcord.normalization.ids import validate_canonical_capability_id
 
 _HUMANIZER_ID = "humanizer.humanizer"
-_SOURCE_TEMPLATE_ROOT = Path(__file__).resolve().parents[3] / "templates"
+
+
+def _source_checkout_template_root() -> Path | None:
+    """Return templates only when this module is in this repository's source layout."""
+
+    module_path = Path(__file__).resolve()
+    checkout_root = module_path.parents[3]
+    expected_module = checkout_root / "src" / "skillcord" / "adapters" / "agents_md.py"
+    repository_sentinels = (
+        checkout_root / ".git",
+        checkout_root / "AGENTS.md",
+        checkout_root / "pyproject.toml",
+        checkout_root
+        / "docs"
+        / "superpowers"
+        / "specs"
+        / "2026-08-11-skillcord-runtime-design.md",
+    )
+    try:
+        module_matches = expected_module.samefile(module_path)
+    except (FileNotFoundError, OSError):
+        return None
+    if not module_matches or not all(sentinel.exists() for sentinel in repository_sentinels):
+        return None
+
+    template_root = checkout_root / "templates"
+    return template_root if template_root.is_dir() else None
+
+
+_SOURCE_TEMPLATE_ROOT = _source_checkout_template_root()
 
 
 def _load_template(name: str) -> str | None:
@@ -28,9 +57,10 @@ def _load_template(name: str) -> str | None:
     if packaged_template.is_file():
         return packaged_template.read_text(encoding="utf-8")
 
-    source_template = _SOURCE_TEMPLATE_ROOT / name
-    if source_template.is_file():
-        return source_template.read_text(encoding="utf-8")
+    if _SOURCE_TEMPLATE_ROOT is not None:
+        source_template = _SOURCE_TEMPLATE_ROOT / name
+        if source_template.is_file():
+            return source_template.read_text(encoding="utf-8")
     return None
 
 
