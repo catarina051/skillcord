@@ -11,7 +11,22 @@ def test_ecc_discovers_declarative_skills_and_reports_hooks() -> None:
 
     assert {skill.normalized_id for skill in snapshot.skills} == {"ecc.security-review"}
     assert snapshot.partial_support is True
-    assert any(asset.kind == "executable-hook" for asset in snapshot.unsupported_assets)
+    assert snapshot.unsupported_assets[0].kind == "executable-hook"
+    assert snapshot.unsupported_assets[0].source_path == (
+        Path("tests/fixtures/providers/ecc/hooks/hooks.json").resolve()
+    )
+    assert snapshot.unsupported_assets[0].reason == (
+        "ECC executable hooks are unsupported and remain inactive in V1"
+    )
+
+
+def test_ecc_root_component_hashes_all_discovered_skills() -> None:
+    snapshot = ECCAdapter().discover(Path("tests/fixtures/providers/ecc"))
+
+    root_component = next(component for component in snapshot.components if component.component_id == "ecc")
+    assert root_component.artifact_hashes == {
+        skill.source_path: skill.content_hash for skill in snapshot.skills
+    }
 
 
 def test_ecc_discovery_does_not_execute_subprocesses(monkeypatch) -> None:

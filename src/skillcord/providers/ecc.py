@@ -35,16 +35,23 @@ class ECCAdapter:
 
         resolved_root = root.resolve()
         skills = [self._discover_skill(path) for path in self._skill_paths(root)]
+        resolved_skills = [
+            skill.model_copy(update={"source_path": skill.source_path.resolve()}) for skill in skills
+        ]
         metadata_components = self._metadata_components(root)
         unsupported_assets = self._unsupported_hook_assets(root)
         return ProviderSnapshot(
             provider_id=self.provider_id,
             root_path=resolved_root,
-            skills=[
-                skill.model_copy(update={"source_path": skill.source_path.resolve()}) for skill in skills
-            ],
+            skills=resolved_skills,
             components=[
-                ProviderComponent(component_id=self.provider_id, source_path=resolved_root),
+                ProviderComponent(
+                    component_id=self.provider_id,
+                    source_path=resolved_root,
+                    artifact_hashes={
+                        skill.source_path: skill.content_hash for skill in resolved_skills
+                    },
+                ),
                 *metadata_components,
             ],
             partial_support=bool(unsupported_assets),
@@ -71,6 +78,7 @@ class ECCAdapter:
                 try:
                     metadata = self._skill_adapter._read_metadata(path)
                     name = self._skill_adapter._required_string(metadata, "name", path)
+                    self._skill_adapter._optional_string(metadata, "description", path)
                     metadata_id = normalize_token(name)
                     if not metadata_id:
                         raise ProviderDiscoveryError(
