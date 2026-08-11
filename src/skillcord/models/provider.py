@@ -1,6 +1,7 @@
 """Normalized provider-discovery schemas."""
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -17,6 +18,8 @@ class SkillRecord(BaseModel):
     content_hash: str
     capabilities: set[str] = Field(default_factory=set)
     harnesses: set[str] = Field(default_factory=set)
+    optional: bool = False
+    execution_mode: Literal["provider", "harness_only"] = "provider"
 
     @property
     def normalized_id(self) -> str:
@@ -56,5 +59,6 @@ class ProviderSnapshot(BaseModel):
     root_path: Path
     skills: list[SkillRecord] = Field(default_factory=list)
     components: list[ProviderComponent] = Field(default_factory=list)
+    runtime_requirements: dict[str, str] = Field(default_factory=dict)
     partial_support: bool = False
     unsupported_assets: list[UnsupportedAsset] = Field(default_factory=list)
