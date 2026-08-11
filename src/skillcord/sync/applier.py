@@ -127,68 +127,17 @@ class _ParentGuard:
             ):
                 raise StaleSyncPlanError(f"parent directory changed: {self.parent}")
 
-    def current_bytes(self, target: Path) -> bytes | None:
-        self.verify()
-        if self.descriptor is not None:
-            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            try:
-                descriptor = os.open(target.name, flags, dir_fd=self.descriptor)
-            except FileNotFoundError:
-                return None
-            try:
-                metadata = os.fstat(descriptor)
-                if not stat.S_ISREG(metadata.st_mode):
-                    raise StaleSyncPlanError(f"sync target is not a regular file: {target}")
-                with os.fdopen(descriptor, "rb") as stream:
-                    descriptor = -1
-                    content = stream.read()
-            finally:
-                if descriptor >= 0:
-                    os.close(descriptor)
-            self.verify()
-            return content
-
-        if target.exists() and not target.is_file():
-            raise StaleSyncPlanError(f"sync target is not a regular file: {target}")
-        fallback_content = target.read_bytes() if target.exists() else None
-        self.verify()
-        return fallback_content
-
-    def current_mode(self, target: Path) -> int | None:
-        if self.current_bytes(target) is None:
-            return None
-        return stat.S_IMODE(target.stat().st_mode)
-
-    def replace(self, source: Path, target: Path) -> None:
-        self.verify()
-        if self.descriptor is not None:
-            os.replace(
-                source.name,
-                target.name,
-                src_dir_fd=self.descriptor,
-                dst_dir_fd=self.descriptor,
-            )
-        else:
-            os.replace(source, target)
-        self.verify()
-
-    def unlink(self, target: Path, *, missing_ok: bool) -> None:
-        self.verify()
-        try:
-            if self.descriptor is not None:
-                os.unlink(target.name, dir_fd=self.descriptor)
-            else:
-                target.unlink()
-        except FileNotFoundError:
-            if not missing_ok:
-                raise
-        self.verify()
-
     def unlink_staged(self, target: Path, *, missing_ok: bool) -> None:
         """Remove a staged name through its retained trusted directory handle."""
 
         if self.descriptor is None:
-            self.unlink(target, missing_ok=missing_ok)
+            self.verify()
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                if not missing_ok:
+                    raise
+            self.verify()
             return
         try:
             os.unlink(target.name, dir_fd=self.descriptor)
@@ -209,8 +158,10 @@ class _StagedChange:
     staging_guard: _ParentGuard
     replacement: _StagedEntry
     backup: _StagedEntry | None
+    original: _StagedEntry | None
     replacement_consumed: bool = False
     backup_consumed: bool = False
+    preserve_backup: bool = False
 
 
 @dataclass(frozen=True)
@@ -256,7 +207,8 @@ class SyncApplier:
                 try:
                     if guard.descriptor is None and guard.parent != root:
                         staging_guard = _ParentGuard.open(root, root)
-                    existing_mode = guard.current_mode(change.path)
+                    original = _capture_original_entry(guard, change)
+                    existing_mode = original.mode if original is not None else None
                     self._before_stage(change.path)
                     guard.verify()
                     replacement = _stage_bytes(
@@ -300,6 +252,7 @@ class SyncApplier:
                         staging_guard=staging_guard,
                         replacement=replacement,
                         backup=backup,
+                        original=original,
                     )
                 )
 
@@ -398,8 +351,8 @@ class SyncApplier:
                 item.backup,
                 trusted=False,
             )
-        current = item.guard.current_bytes(item.change.path)
-        if current != item.change.before:
+        current = _entry_at(item.guard, item.change.path, trusted=False)
+        if not _same_entry(current, item.original):
             raise StaleSyncPlanError(
                 f"file changed after preview: {item.change.relative_path.as_posix()}"
             )
@@ -410,30 +363,37 @@ class SyncApplier:
         for item in reversed(applied):
             try:
                 trusted_parent = item.guard.descriptor is not None
-                current = _current_bytes(
+                current = _entry_at(
                     item.guard,
                     item.change.path,
                     trusted=trusted_parent,
                 )
-                if current == item.change.before:
+                if _same_entry(current, item.original):
                     continue
-                if current != item.change.after:
+                if current is None or not _same_entry(current, item.replacement):
                     raise StaleSyncPlanError(
-                        f"cannot safely roll back concurrently changed file: "
+                        "installed file changed; refusing rollback: "
                         f"{item.change.relative_path.as_posix()}"
                     )
                 if item.change.before is None:
-                    _verify_entry_at(
-                        item.guard,
-                        item.change.path,
-                        item.replacement,
-                        trusted=trusted_parent,
-                        label="installed file changed; refusing rollback",
-                    )
-                    if trusted_parent:
-                        item.guard.unlink_staged(item.change.path, missing_ok=False)
-                    else:
-                        item.guard.unlink(item.change.path, missing_ok=False)
+                    try:
+                        _quarantine_and_delete(
+                            item.guard,
+                            item.change.path,
+                            item.replacement,
+                            trusted=trusted_parent,
+                            label="installed file changed; refusing rollback",
+                        )
+                    except FileNotFoundError:
+                        if _entry_at(
+                            item.guard,
+                            item.change.path,
+                            trusted=trusted_parent,
+                        ) is not None:
+                            raise StaleSyncPlanError(
+                                "installed file changed; refusing rollback: "
+                                f"{item.change.relative_path.as_posix()}"
+                            ) from None
                 else:
                     if item.backup is None:
                         raise RuntimeError("missing rollback backup for existing file")
@@ -446,8 +406,32 @@ class SyncApplier:
                     )
                     item.backup_consumed = True
             except (OSError, RuntimeError) as error:
+                if item.backup is not None and not item.backup_consumed:
+                    item.preserve_backup = True
                 errors.append(error)
         return errors
+
+
+def _capture_original_entry(
+    guard: _ParentGuard,
+    change: PlannedFileChange,
+) -> _StagedEntry | None:
+    original = _entry_at(guard, change.path, trusted=False)
+    if change.before is None:
+        if original is not None:
+            raise StaleSyncPlanError(
+                f"file changed after preview: {change.relative_path.as_posix()}"
+            )
+        return None
+    if (
+        original is None
+        or original.size != len(change.before)
+        or original.content_hash != hashlib.sha256(change.before).digest()
+    ):
+        raise StaleSyncPlanError(
+            f"file changed after preview: {change.relative_path.as_posix()}"
+        )
+    return original
 
 
 def _directory_relative_operations_supported() -> bool:
@@ -474,16 +458,6 @@ def _capture_parent_chain(root: Path, parent: Path) -> tuple[_PathIdentity, ...]
     return tuple(_PathIdentity.capture(path) for path in chain)
 
 
-def _verify_open_directory(descriptor: int, expected: _PathIdentity) -> None:
-    opened = os.fstat(descriptor)
-    if (opened.st_dev, opened.st_ino, stat.S_IFMT(opened.st_mode)) != (
-        expected.device,
-        expected.inode,
-        expected.file_type,
-    ):
-        raise StaleSyncPlanError(f"parent directory changed: {expected.path}")
-
-
 def _stage_bytes(
     guard: _ParentGuard,
     target: Path,
@@ -503,7 +477,16 @@ def _stage_bytes(
             dir=guard.parent,
         )
         temporary = Path(temporary_name)
-    created_identity = _FileIdentity.from_stat(os.fstat(descriptor))
+    created_metadata = os.fstat(descriptor)
+    created_identity = _FileIdentity.from_stat(created_metadata)
+    expected_mode = stat.S_IMODE(created_metadata.st_mode)
+    cleanup_entry = _StagedEntry(
+        path=temporary,
+        identity=created_identity,
+        size=0,
+        mode=expected_mode,
+        content_hash=hashlib.sha256(b"").digest(),
+    )
     try:
         with os.fdopen(descriptor, "wb") as stream:
             try:
@@ -516,25 +499,41 @@ def _stage_bytes(
                     if descriptor_chmod is None:
                         raise RuntimeError("descriptor chmod unavailable for safe staging")
                     descriptor_chmod(stream.fileno(), mode)
+                    expected_mode = mode
                 after_write(temporary)
                 guard.verify()
                 metadata = os.fstat(stream.fileno())
+                if stat.S_IMODE(metadata.st_mode) != expected_mode:
+                    raise StaleSyncPlanError(f"staged file mode changed: {temporary}")
+                if (
+                    _FileIdentity.from_stat(metadata) != created_identity
+                    or metadata.st_size != len(content)
+                ):
+                    raise StaleSyncPlanError(f"staged file changed: {temporary}")
                 entry = _StagedEntry(
                     path=temporary,
-                    identity=_FileIdentity.from_stat(metadata),
-                    size=metadata.st_size,
-                    mode=stat.S_IMODE(metadata.st_mode),
+                    identity=created_identity,
+                    size=len(content),
+                    mode=expected_mode,
                     content_hash=hashlib.sha256(content).digest(),
                 )
             except BaseException as error:
-                _add_error_notes(error, "payload scrub", _truncate_open_stream(stream))
+                scrub_errors = _truncate_open_stream(stream)
+                cleanup_entry = _StagedEntry(
+                    path=temporary,
+                    identity=created_identity,
+                    size=0,
+                    mode=expected_mode,
+                    content_hash=hashlib.sha256(b"").digest(),
+                )
+                _add_error_notes(error, "payload scrub", scrub_errors)
                 raise
         return entry
     except BaseException as error:
         _add_error_notes(
             error,
             "cleanup",
-            _cleanup_owned_path(guard, temporary, created_identity),
+            _cleanup_owned_path(guard, cleanup_entry),
         )
         raise
 
@@ -625,47 +624,136 @@ def _verify_entry_at(
         raise StaleSyncPlanError(f"{label}: {path}")
 
 
-def _current_bytes(guard: _ParentGuard, path: Path, *, trusted: bool) -> bytes | None:
-    if not trusted:
-        return guard.current_bytes(path)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+def _entry_at(
+    guard: _ParentGuard,
+    path: Path,
+    *,
+    trusted: bool,
+) -> _StagedEntry | None:
     try:
-        descriptor = os.open(path.name, flags, dir_fd=guard.descriptor)
+        identity, size, mode, content_hash = _observe_file(guard, path, trusted=trusted)
     except FileNotFoundError:
         return None
-    try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise StaleSyncPlanError(f"sync target is not a regular file: {path}")
-        with os.fdopen(descriptor, "rb") as stream:
-            descriptor = -1
-            return stream.read()
-    finally:
-        if descriptor >= 0:
+    return _StagedEntry(
+        path=path,
+        identity=identity,
+        size=size,
+        mode=mode,
+        content_hash=content_hash,
+    )
+
+
+def _same_entry(left: _StagedEntry | None, right: _StagedEntry | None) -> bool:
+    if left is None or right is None:
+        return left is right
+    return (
+        left.identity,
+        left.size,
+        left.mode,
+        left.content_hash,
+    ) == (
+        right.identity,
+        right.size,
+        right.mode,
+        right.content_hash,
+    )
+
+
+def _quarantine_name_available(
+    guard: _ParentGuard,
+    path: Path,
+    *,
+    trusted: bool,
+) -> bool:
+    if not trusted:
+        guard.verify()
+    if guard.descriptor is not None:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path.name, flags, dir_fd=guard.descriptor)
+        except FileNotFoundError:
+            available = True
+        except OSError:
+            available = False
+        else:
             os.close(descriptor)
+            available = False
+    else:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            available = True
+        except OSError:
+            available = False
+        else:
+            available = False
+    if not trusted:
+        guard.verify()
+    return available
+
+
+def _rename_to_quarantine(
+    guard: _ParentGuard,
+    source: Path,
+    quarantine: Path,
+    *,
+    trusted: bool,
+) -> None:
+    if guard.descriptor is not None:
+        os.rename(
+            source.name,
+            quarantine.name,
+            src_dir_fd=guard.descriptor,
+            dst_dir_fd=guard.descriptor,
+        )
+        return
+    if not trusted:
+        guard.verify()
+    os.rename(source, quarantine)
+    if not trusted:
+        guard.verify()
+
+
+def _quarantine_and_delete(
+    guard: _ParentGuard,
+    path: Path,
+    expected: _StagedEntry,
+    *,
+    trusted: bool,
+    label: str,
+) -> None:
+    for _attempt in range(100):
+        quarantine = guard.parent / (
+            f".{path.name}.{secrets.token_hex(8)}.skillcord.quarantine"
+        )
+        if not _quarantine_name_available(guard, quarantine, trusted=trusted):
+            continue
+        try:
+            _rename_to_quarantine(
+                guard,
+                path,
+                quarantine,
+                trusted=trusted,
+            )
+        except FileExistsError:
+            continue
+        _verify_entry_at(
+            guard,
+            quarantine,
+            expected,
+            trusted=trusted,
+            label=label,
+        )
+        guard.unlink_staged(quarantine, missing_ok=False)
+        return
+    raise FileExistsError(f"could not allocate a quarantine name for: {path}")
 
 
 def _cleanup_owned_path(
     guard: _ParentGuard,
-    path: Path,
-    identity: _FileIdentity,
+    entry: _StagedEntry,
 ) -> list[BaseException]:
-    errors: list[BaseException] = []
-    trusted = guard.descriptor is not None
-    try:
-        observed_identity, _size, _mode, _hash = _observe_file(
-            guard,
-            path,
-            trusted=trusted,
-        )
-        if observed_identity != identity:
-            raise StaleSyncPlanError(f"staged file changed; refusing cleanup: {path}")
-        guard.unlink_staged(path, missing_ok=True)
-    except FileNotFoundError:
-        pass
-    except (OSError, StaleSyncPlanError) as error:
-        errors.append(error)
-    return errors
+    return _cleanup_entries(guard, [entry])
 
 
 def _cleanup_entries(
@@ -676,13 +764,16 @@ def _cleanup_entries(
     trusted = guard.descriptor is not None
     for entry in entries:
         try:
-            _verify_entry_at(guard, entry.path, entry, trusted=trusted)
-            guard.unlink_staged(entry.path, missing_ok=True)
+            _quarantine_and_delete(
+                guard,
+                entry.path,
+                entry,
+                trusted=trusted,
+                label="staged file changed; refusing cleanup",
+            )
         except FileNotFoundError:
             pass
         except (OSError, StaleSyncPlanError) as error:
-            if isinstance(error.__cause__, FileNotFoundError):
-                continue
             errors.append(error)
     return errors
 
@@ -693,7 +784,7 @@ def _cleanup_staged(staged: list[_StagedChange]) -> list[BaseException]:
         entries: list[_StagedEntry] = []
         if not item.replacement_consumed:
             entries.append(item.replacement)
-        if item.backup is not None and not item.backup_consumed:
+        if item.backup is not None and not item.backup_consumed and not item.preserve_backup:
             entries.append(item.backup)
         errors.extend(_cleanup_entries(item.staging_guard, entries))
     return errors
