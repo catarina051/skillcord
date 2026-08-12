@@ -7,6 +7,7 @@ from pathlib import Path
 
 from skillcord.adapters.base import GeneratedArtifact
 from skillcord.decisions.validation import validate_override_references
+from skillcord.discovery.harnesses import HarnessDetection
 from skillcord.locking.service import LockService
 from skillcord.managed_blocks.writer import render_managed_update
 from skillcord.models.capability import CapabilityGroup
@@ -18,6 +19,8 @@ from skillcord.models.status import CheckResult, CheckStatus
 STABLE_CHECK_IDS = frozenset(
     {
         "schema.project",
+        "harness.availability",
+        "capability.satisfaction",
         "provider.presence",
         "lock.integrity",
         "override.missing_reference",
@@ -51,11 +54,14 @@ def check_project_schema(
 def check_provider_presence(
     providers: Sequence[ProviderSnapshot],
     required_provider_ids: Collection[str],
+    lock: LockFile | None,
 ) -> CheckResult:
     """Report required provider roots that were not discovered."""
 
     present = {provider.provider_id for provider in providers}
     required = set(required_provider_ids)
+    if lock is not None:
+        required.update(lock.providers)
     missing = sorted(required - present)
     return CheckResult(
         id="provider.presence",
@@ -68,21 +74,88 @@ def check_provider_presence(
     )
 
 
-def check_lock_integrity(lock: LockFile | None, lock_service: LockService) -> CheckResult:
-    """Collapse detailed lock drift evidence into one stable doctor check."""
+def check_harness_availability(
+    project: ProjectConfig | None,
+    harnesses: Sequence[HarnessDetection],
+) -> CheckResult:
+    """Require local discovery evidence for every requested harness."""
+
+    requested = set(project.ai.harnesses) if project is not None else set()
+    available = {harness.harness_id for harness in harnesses}
+    missing = sorted(requested - available)
+    return CheckResult(
+        id="harness.availability",
+        status=CheckStatus.FAIL if missing else CheckStatus.PASS,
+        details={
+            "requested": sorted(requested),
+            "available": sorted(available),
+            "missing": missing,
+        },
+    )
+
+
+def check_capability_satisfaction(
+    project: ProjectConfig | None,
+    providers: Sequence[ProviderSnapshot],
+) -> CheckResult:
+    """Match requested capabilities only against explicit provider skill evidence."""
+
+    requested = set(project.ai.desired_capabilities) if project is not None else set()
+    available = {
+        evidence
+        for provider in providers
+        for skill in provider.skills
+        for evidence in {skill.normalized_id, skill.skill_id, *skill.capabilities}
+    }
+    missing = sorted(requested - available)
+    return CheckResult(
+        id="capability.satisfaction",
+        status=CheckStatus.FAIL if missing else CheckStatus.PASS,
+        details={
+            "requested": sorted(requested),
+            "available": sorted(available),
+            "missing": missing,
+        },
+    )
+
+
+def check_lock_integrity(
+    lock: LockFile | None,
+    lock_service: LockService,
+    providers: Sequence[ProviderSnapshot],
+    override_reference_ids: Collection[str],
+) -> CheckResult:
+    """Check lock drift plus exact current provider and decision coverage."""
 
     if lock is None:
         return CheckResult(
             id="lock.integrity",
             status=CheckStatus.FAIL,
-            details={"reason": "lock_missing", "failures": []},
+            details={
+                "reason": "lock_missing",
+                "failures": [],
+                "missing_providers": sorted(provider.provider_id for provider in providers),
+                "extra_providers": [],
+                "missing_resolved_ids": sorted(override_reference_ids),
+                "extra_resolved_ids": [],
+            },
         )
 
     evidence = lock_service.check_drift(lock)
     failures = [check for check in evidence if check.status is CheckStatus.FAIL]
+    discovered_provider_ids = {provider.provider_id for provider in providers}
+    locked_provider_ids = set(lock.providers)
+    current_resolved_ids = set(override_reference_ids)
+    missing_providers = sorted(discovered_provider_ids - locked_provider_ids)
+    extra_providers = sorted(locked_provider_ids - discovered_provider_ids)
+    missing_resolved_ids = sorted(current_resolved_ids - lock.resolved_ids)
+    extra_resolved_ids = sorted(lock.resolved_ids - current_resolved_ids)
+    coverage_failed = any(
+        (missing_providers, extra_providers, missing_resolved_ids, extra_resolved_ids)
+    )
     return CheckResult(
         id="lock.integrity",
-        status=CheckStatus.FAIL if failures else CheckStatus.PASS,
+        status=CheckStatus.FAIL if failures or coverage_failed else CheckStatus.PASS,
         details={
             "providers_checked": len(lock.providers),
             "artifacts_checked": sum(
@@ -94,6 +167,10 @@ def check_lock_integrity(lock: LockFile | None, lock_service: LockService) -> Ch
             "failures": [
                 {"id": failure.id, "details": failure.details} for failure in failures
             ],
+            "missing_providers": missing_providers,
+            "extra_providers": extra_providers,
+            "missing_resolved_ids": missing_resolved_ids,
+            "extra_resolved_ids": extra_resolved_ids,
         },
     )
 
@@ -197,30 +274,50 @@ def check_unresolved_conflicts(
 ) -> CheckResult:
     """Keep ordinary unresolved groups visible and fail only single-owner policy."""
 
-    unresolved = sorted(
-        group.capability_id
-        for group in groups
-        if group.capability_id not in overrides.overrides
-    )
-    blocking = sorted(
-        group.capability_id
-        for group in groups
-        if group.single_owner_required
-        and (
-            (override := overrides.overrides.get(group.capability_id)) is None
-            or override.prefer is None
+    unresolved: set[str] = set()
+    blocking: set[str] = set()
+    invalid_references: list[dict[str, object]] = []
+    for group in sorted(groups, key=lambda item: item.capability_id):
+        override = overrides.overrides.get(group.capability_id)
+        if override is None:
+            unresolved.add(group.capability_id)
+            if group.single_owner_required:
+                blocking.add(group.capability_id)
+            continue
+
+        candidate_ids = {candidate.normalized_id for candidate in group.candidates}
+        references = (
+            ({override.prefer} if override.prefer is not None else set())
+            | set(override.suppress)
         )
-    )
-    if blocking:
+        invalid = sorted(references - candidate_ids)
+        if invalid:
+            unresolved.add(group.capability_id)
+            blocking.add(group.capability_id)
+            invalid_references.append(
+                {"capability_id": group.capability_id, "skill_ids": invalid}
+            )
+        if group.single_owner_required and override.prefer is None:
+            unresolved.add(group.capability_id)
+            blocking.add(group.capability_id)
+
+    unresolved_list = sorted(unresolved)
+    blocking_list = sorted(blocking)
+    if blocking_list:
         status = CheckStatus.FAIL
-    elif unresolved:
+    elif unresolved_list:
         status = CheckStatus.WARNING
     else:
         status = CheckStatus.PASS
     return CheckResult(
         id="conflicts.unresolved",
         status=status,
-        details={"count": len(unresolved), "capabilities": unresolved, "blocking": blocking},
+        details={
+            "count": len(unresolved_list),
+            "capabilities": unresolved_list,
+            "blocking": blocking_list,
+            "invalid_references": invalid_references,
+        },
     )
 
 
@@ -273,6 +370,19 @@ def discovered_skill_ids(providers: Sequence[ProviderSnapshot]) -> frozenset[str
     """Return every normalized skill ID in deterministic provider snapshots."""
 
     return frozenset(skill.normalized_id for provider in providers for skill in provider.skills)
+
+
+def override_reference_ids(overrides: OverrideConfig) -> frozenset[str]:
+    """Return every normalized skill ID referenced by current decisions."""
+
+    return frozenset(
+        skill_id
+        for override in overrides.overrides.values()
+        for skill_id in (
+            *([override.prefer] if override.prefer is not None else []),
+            *override.suppress,
+        )
+    )
 
 
 def ensure_unique_check_ids(checks: Sequence[CheckResult]) -> None:

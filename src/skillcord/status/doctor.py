@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from skillcord.adapters.base import GeneratedArtifact
+from skillcord.discovery.harnesses import HarnessDetection
 from skillcord.locking.service import LockService
 from skillcord.models.capability import CapabilityGroup
 from skillcord.models.config import OverrideConfig, ProjectConfig
@@ -16,6 +17,8 @@ from skillcord.models.provider import ProviderSnapshot
 from skillcord.models.status import CheckResult, StatusReport
 from skillcord.status.checks import (
     check_adapter_drift,
+    check_capability_satisfaction,
+    check_harness_availability,
     check_humanizer_policy,
     check_lock_integrity,
     check_override_references,
@@ -25,6 +28,7 @@ from skillcord.status.checks import (
     check_unresolved_conflicts,
     discovered_skill_ids,
     ensure_unique_check_ids,
+    override_reference_ids,
 )
 
 
@@ -35,6 +39,7 @@ class DoctorContext:
     project: ProjectConfig | None = None
     project_error: str | None = None
     providers: Sequence[ProviderSnapshot] = ()
+    harnesses: Sequence[HarnessDetection] = ()
     required_provider_ids: frozenset[str] = frozenset()
     lock: LockFile | None = None
     overrides: OverrideConfig = field(
@@ -61,13 +66,25 @@ class Doctor:
         """Return a timestamped, deterministically ordered readiness report."""
 
         skill_ids = discovered_skill_ids(context.providers)
+        decision_ids = override_reference_ids(context.overrides)
         desired_capabilities = (
             context.project.ai.desired_capabilities if context.project is not None else ()
         )
         checks: list[CheckResult] = [
             check_project_schema(context.project, context.project_error),
-            check_provider_presence(context.providers, context.required_provider_ids),
-            check_lock_integrity(context.lock, self._lock_service),
+            check_harness_availability(context.project, context.harnesses),
+            check_capability_satisfaction(context.project, context.providers),
+            check_provider_presence(
+                context.providers,
+                context.required_provider_ids,
+                context.lock,
+            ),
+            check_lock_integrity(
+                context.lock,
+                self._lock_service,
+                context.providers,
+                decision_ids,
+            ),
             check_override_references(context.overrides, skill_ids),
             check_adapter_drift(context.project_root, context.adapter_artifacts),
             check_unresolved_conflicts(context.conflict_groups, context.overrides),
