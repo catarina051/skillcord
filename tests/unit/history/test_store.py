@@ -442,8 +442,8 @@ def test_append_that_commits_then_raises_does_not_leave_orphan_history(
     tmp_path: Path,
 ) -> None:
     class CommitThenRaiseStore(HistoryStore):
-        def append(self, entry: HistoryEntry) -> None:
-            super().append(entry)
+        def _atomic_replace(self, payload: bytes) -> None:
+            super()._atomic_replace(payload)
             raise OSError("injected failure after history commit")
 
     plan = _plan(tmp_path, "AGENTS.md")
@@ -456,6 +456,37 @@ def test_append_that_commits_then_raises_does_not_leave_orphan_history(
     assert store.list() == []
 
 
+def test_precommit_append_failure_preserves_an_independent_equal_entry(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / ".ai" / "history.jsonl"
+
+    class AppendEqualThenRaiseBeforeCommitStore(HistoryStore):
+        def append(self, entry: HistoryEntry) -> None:
+            HistoryStore(self.path).append(entry)
+            super().append(entry)
+
+        def _atomic_replace(self, _payload: bytes) -> None:
+            raise OSError("injected failure before this store commits")
+
+    plan = _plan(tmp_path, "AGENTS.md")
+    fixed_now = datetime(2026, 8, 11, 17, 0, tzinfo=UTC)
+    store = AppendEqualThenRaiseBeforeCommitStore(path)
+
+    with pytest.raises(RuntimeError, match="audit"):
+        SyncApplier(
+            history_store=store,
+            clock=lambda: fixed_now,
+            provider_revisions={"superpowers": {"old": "a", "new": "b"}},
+        ).apply(
+            plan,
+            approved=True,
+        )
+
+    assert (tmp_path / "AGENTS.md").read_bytes() == b"old AGENTS.md\n"
+    assert HistoryStore(path).list() == [_entry()]
+
+
 def test_failed_append_compensation_preserves_an_independent_successful_append(
     tmp_path: Path,
 ) -> None:
@@ -465,10 +496,18 @@ def test_failed_append_compensation_preserves_an_independent_successful_append(
     )
 
     class AppendOtherThenCommitAndRaiseStore(HistoryStore):
+        _fail_after_commit = False
+
         def append(self, entry: HistoryEntry) -> None:
             HistoryStore(self.path).append(independent_entry)
+            self._fail_after_commit = True
             super().append(entry)
-            raise OSError("injected failure after history commit")
+
+        def _atomic_replace(self, payload: bytes) -> None:
+            super()._atomic_replace(payload)
+            if self._fail_after_commit:
+                self._fail_after_commit = False
+                raise OSError("injected failure after history commit")
 
     plan = _plan(tmp_path, "AGENTS.md")
     store = AppendOtherThenCommitAndRaiseStore(path)
@@ -484,13 +523,13 @@ def test_failed_audit_compensation_reports_that_configuration_remains_applied(
     tmp_path: Path,
 ) -> None:
     class UncompensatableCommittedStore(HistoryStore):
-        def append(self, entry: HistoryEntry) -> None:
-            super().append(entry)
+        def _atomic_replace(self, payload: bytes) -> None:
+            super()._atomic_replace(payload)
             raise OSError("injected failure after history commit")
 
         def compensate_append(
             self,
-            checkpoint: history_module.HistoryCheckpoint,
+            token: history_module.HistoryAppendToken,
             entry: HistoryEntry,
         ) -> None:
             raise OSError("injected compensation failure")

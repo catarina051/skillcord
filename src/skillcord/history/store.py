@@ -140,6 +140,33 @@ class HistoryCheckpoint:
     entries: tuple[HistoryEntry, ...]
 
 
+@dataclass(frozen=True)
+class HistoryAppendToken:
+    """Identify one committed append by its exact coordinated position."""
+
+    checkpoint: HistoryCheckpoint
+    entry_index: int
+
+
+class HistoryAppendError(OSError):
+    """Report whether a failed append committed and how to identify it."""
+
+    def __init__(
+        self,
+        original_error: Exception,
+        *,
+        committed: bool | None,
+        token: HistoryAppendToken | None,
+    ) -> None:
+        self.original_error = original_error
+        self.committed = committed
+        self.token = token
+        outcome = {True: "committed", False: "not committed", None: "indeterminate"}[
+            committed
+        ]
+        super().__init__(f"history append failed ({outcome}): {original_error}")
+
+
 class ProviderRevision(BaseModel):
     """The prior and newly applied immutable revision, when available."""
 
@@ -249,9 +276,27 @@ class HistoryStore:
         validated = HistoryEntry.model_validate(entry.model_dump(mode="python"))
         self._read_entries()
         with self._coordinated():
-            entries = self._read_entries()
+            entries = tuple(self._read_entries())
+            existed = self.path.exists()
+            checkpoint = HistoryCheckpoint(
+                existed=existed,
+                content=self.path.read_bytes() if existed else b"",
+                entries=entries,
+            )
+            token = HistoryAppendToken(
+                checkpoint=checkpoint,
+                entry_index=len(entries),
+            )
             payload = self._serialize((*entries, validated))
-            self._atomic_replace(payload)
+            try:
+                self._atomic_replace(payload)
+            except Exception as error:
+                committed = self._classify_failed_replace(checkpoint, payload)
+                raise HistoryAppendError(
+                    error,
+                    committed=committed,
+                    token=token if committed is True else None,
+                ) from error
 
     def list(self) -> builtins.list[HistoryEntry]:
         """Return entries in commit order, rejecting any malformed state."""
@@ -276,26 +321,28 @@ class HistoryStore:
 
     def compensate_append(
         self,
-        checkpoint: HistoryCheckpoint,
+        token: HistoryAppendToken,
         entry: HistoryEntry,
     ) -> None:
         """Remove only a failed append while preserving later successful appends."""
 
         validated = HistoryEntry.model_validate(entry.model_dump(mode="python"))
+        checkpoint = token.checkpoint
         with self._coordinated():
             current = self._read_entries()
             prefix = list(checkpoint.entries)
-            if current[: len(prefix)] != prefix:
+            if token.entry_index != len(prefix) or current[: token.entry_index] != prefix:
                 raise HistoryFormatError(
                     "history changed non-append-only during audit compensation"
                 )
-            appended = current[len(prefix) :]
-            try:
-                relative_index = appended.index(validated)
-            except ValueError:
-                return
-            absolute_index = len(prefix) + relative_index
-            remaining = current[:absolute_index] + current[absolute_index + 1 :]
+            if (
+                len(current) <= token.entry_index
+                or current[token.entry_index] != validated
+            ):
+                raise HistoryFormatError(
+                    "committed history append changed before compensation"
+                )
+            remaining = current[: token.entry_index] + current[token.entry_index + 1 :]
             if remaining == prefix:
                 if checkpoint.existed:
                     self._atomic_replace(checkpoint.content)
@@ -311,6 +358,24 @@ class HistoryStore:
                     self.path.unlink()
                 except FileNotFoundError:
                     pass
+
+    def _classify_failed_replace(
+        self,
+        checkpoint: HistoryCheckpoint,
+        payload: bytes,
+    ) -> bool | None:
+        try:
+            if self.path.is_symlink():
+                return None
+            existed = self.path.exists()
+            content = self.path.read_bytes() if existed and self.path.is_file() else b""
+        except OSError:
+            return None
+        if existed == checkpoint.existed and content == checkpoint.content:
+            return False
+        if existed and content == payload:
+            return True
+        return None
 
     @contextmanager
     def _coordinated(self) -> Iterator[None]:

@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, cast
 
 from skillcord.history.store import (
-    HistoryCheckpoint,
+    HistoryAppendError,
     HistoryEntry,
     HistoryStore,
     ProviderRevision,
@@ -71,7 +71,7 @@ class SyncAuditCompensationError(RuntimeError):
         self.original_error = original_error
         self.compensation_error = compensation_error
         super().__init__(
-            "sync audit failed after history commit and compensation failed; "
+            "sync audit failed with an unconfirmed or uncompensated history commit; "
             f"configuration remains applied: {original_error}; {compensation_error}"
         )
 
@@ -226,9 +226,8 @@ class SyncApplier:
             return ApplyResult(applied=False, changed_files=())
 
         history_entry = self._prepare_history_entry(plan)
-        history_checkpoint: HistoryCheckpoint | None = None
         if history_entry is not None and self._history_store is not None:
-            history_checkpoint = self._history_store.checkpoint()
+            self._history_store.checkpoint()
         self._preflight(plan)
         root = plan.project_root.resolve(strict=True)
         staged: list[_StagedChange] = []
@@ -306,20 +305,30 @@ class SyncApplier:
             if history_entry is not None and self._history_store is not None:
                 try:
                     self._history_store.append(history_entry)
-                except Exception as error:
-                    if history_checkpoint is None:
-                        raise RuntimeError("missing sync history checkpoint") from error
+                except HistoryAppendError as error:
+                    if error.committed is False:
+                        raise SyncAuditError(error.original_error) from error
+                    if error.committed is not True or error.token is None:
+                        raise SyncAuditCompensationError(
+                            error.original_error,
+                            RuntimeError("history append commit outcome is indeterminate"),
+                        ) from error
                     try:
                         self._history_store.compensate_append(
-                            history_checkpoint,
+                            error.token,
                             history_entry,
                         )
                     except Exception as compensation_error:
                         raise SyncAuditCompensationError(
-                            error,
+                            error.original_error,
                             compensation_error,
                         ) from compensation_error
-                    raise SyncAuditError(error) from error
+                    raise SyncAuditError(error.original_error) from error
+                except Exception as error:
+                    raise SyncAuditCompensationError(
+                        error,
+                        RuntimeError("history append did not report a commit outcome"),
+                    ) from error
         except BaseException as error:
             if isinstance(error, SyncAuditCompensationError):
                 cleanup_errors = _cleanup_staged(staged)
