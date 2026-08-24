@@ -12,6 +12,7 @@ venv/
 .coverage
 htmlcov/
 .superpowers/
+.worktrees/
 
 # Build
 build/
