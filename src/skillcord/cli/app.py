@@ -17,7 +17,7 @@ from skillcord.cli.rendering import render_conflicts, render_history, render_sca
 from skillcord.decisions.store import DecisionStore
 from skillcord.discovery.service import DiscoveryResult, DiscoveryService
 from skillcord.history.store import HistoryEntry, HistoryStore
-from skillcord.models.config import AIConfig, ProjectConfig, ProjectInfo
+from skillcord.models.config import AIConfig, OverrideConfig, ProjectConfig, ProjectInfo
 from skillcord.models.status import StatusReport
 from skillcord.overlap.aliases import AliasRegistry
 from skillcord.overlap.grouping import group_capabilities
@@ -32,6 +32,7 @@ PROJECT_ROOT_OPTION = typer.Option(Path("."), "--project-root", file_okay=False,
 SOURCES_OPTION = typer.Option(None, "--source")
 HARNESSES_OPTION = typer.Option(None, "--harness")
 YES_OPTION = typer.Option(False, "--yes")
+NON_INTERACTIVE_OPTION = typer.Option(False, "--non-interactive")
 JSON_OPTION = typer.Option(False, "--json")
 
 
@@ -95,6 +96,16 @@ def _scan(root: Path, sources: Sequence[str], services: RuntimeServices) -> Disc
     return services.discovery.scan(root, _source_roots(sources))
 
 
+def _load_overrides(root: Path) -> tuple[DecisionStore, OverrideConfig]:
+    """Load persisted decisions, translating only malformed local schema state."""
+
+    store = DecisionStore(root / ".ai" / "overrides.yaml")
+    try:
+        return store, store.load()
+    except (OSError, yaml.YAMLError, ValidationError) as error:
+        raise CLIUsageError(f"override configuration is invalid: {store.path}") from error
+
+
 def _sync_context(
     root: Path,
     sources: Sequence[str],
@@ -103,7 +114,7 @@ def _sync_context(
 ) -> SyncContext:
     project = _load_project(root)
     discovered = _scan(root, sources, services)
-    overrides = DecisionStore(root / ".ai" / "overrides.yaml").load()
+    _, overrides = _load_overrides(root)
     skills = tuple(skill for provider in discovered.providers for skill in provider.skills)
     groups = tuple(group_capabilities(skills, AliasRegistry({}), overrides))
     return SyncContext(
@@ -136,9 +147,30 @@ def run_init(root: Path, harnesses: Sequence[str]) -> None:
     )
 
 
-def run_conflicts(root: Path, sources: Sequence[str], services: RuntimeServices) -> str:
+def run_conflicts(
+    root: Path,
+    sources: Sequence[str],
+    decisions: Mapping[str, str],
+    services: RuntimeServices,
+) -> str:
     context = _sync_context(root, sources, False, services)
-    resolution = ConflictResolver().resolve(context.conflict_groups, {})
+    resolution = ConflictResolver().resolve(context.conflict_groups, decisions)
+    store, _ = _load_overrides(root)
+    for group in resolution.groups:
+        action = decisions.get(group.capability_id)
+        if action is None:
+            continue
+        if action == "keep-all":
+            store.save_decision(group.capability_id, None, [])
+            continue
+        prefix = "prefer:"
+        if not action.startswith(prefix):
+            raise CLIUsageError(f"invalid conflict action for {group.capability_id}: {action}")
+        preferred = action.removeprefix(prefix)
+        candidate_ids = {candidate.normalized_id for candidate in group.candidates}
+        if preferred not in candidate_ids:
+            raise CLIUsageError(f"invalid conflict owner for {group.capability_id}: {preferred}")
+        store.save_decision(group.capability_id, preferred, sorted(candidate_ids - {preferred}))
     return render_conflicts(resolution.groups, ConflictResolver().question_budget)
 
 
@@ -161,7 +193,7 @@ def run_doctor(root: Path, sources: Sequence[str], services: RuntimeServices) ->
         project = None
         project_error = str(error)
     discovered = _scan(root, sources, services)
-    overrides = DecisionStore(root / ".ai" / "overrides.yaml").load()
+    _, overrides = _load_overrides(root)
     skills = tuple(skill for provider in discovered.providers for skill in provider.skills)
     return services.doctor.run(
         DoctorContext(
@@ -223,10 +255,33 @@ def conflicts_command(
     source: list[str] = SOURCES_OPTION,
 ) -> None:
     try:
-        typer.echo(run_conflicts(project_root, source or (), _command_services(project_root)), nl=False)
-    except CLIUsageError:
+        services = _command_services(project_root)
+        context = _sync_context(project_root, source or (), False, services)
+        resolution = ConflictResolver().resolve(context.conflict_groups, {})
+        decisions: dict[str, str] = {}
+        for group in resolution.prompted_groups:
+            typer.echo(f"{group.capability_id}: 0 keep-all")
+            for index, candidate in enumerate(group.candidates, start=1):
+                typer.echo(f"{index} prefer {candidate.normalized_id}")
+            selected = typer.prompt("Select", default="0")
+            try:
+                choice = int(selected)
+            except ValueError as error:
+                raise CLIUsageError("conflict selection must be a number") from error
+            if choice == 0:
+                decisions[group.capability_id] = "keep-all"
+            elif 1 <= choice <= len(group.candidates):
+                decisions[group.capability_id] = f"prefer:{group.candidates[choice - 1].normalized_id}"
+            else:
+                raise CLIUsageError("conflict selection is out of range")
+        typer.echo(run_conflicts(project_root, source or (), decisions, services), nl=False)
+    except CLIUsageError as error:
         # An uninitialized project has no persisted conflicts and is still inspectable.
-        typer.echo(render_conflicts((), ConflictResolver().question_budget), nl=False)
+        if not _project_path(project_root).exists():
+            typer.echo(render_conflicts((), ConflictResolver().question_budget), nl=False)
+        else:
+            typer.echo(str(error), err=True)
+            raise typer.Exit(2) from error
 
 
 @app.command("diff")
@@ -247,10 +302,13 @@ def sync_command(
     project_root: Path = PROJECT_ROOT_OPTION,
     source: list[str] = SOURCES_OPTION,
     yes: bool = YES_OPTION,
+    non_interactive: bool = NON_INTERACTIVE_OPTION,
 ) -> None:
     services = _command_services(project_root)
     try:
-        context = _sync_context(project_root, source or (), yes, services)
+        if non_interactive and not yes:
+            raise CLIUsageError("--non-interactive requires explicit --yes approval")
+        context = _sync_context(project_root, source or (), non_interactive, services)
         plan = services.planner.plan(context)
         if plan.changes:
             typer.echo(plan.diff_text(), nl=False)
