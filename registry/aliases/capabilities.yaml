@@ -1,0 +1,8 @@
+schema_version: 1
+aliases:
+  test-driven-development:
+    - tdd
+    - test-first-development
+  code-review:
+    - code-review
+    - review-code

@@ -1,0 +1,15 @@
+## Managed AI capability policy
+
+The active provider capability identifiers for this project are:
+{% for capability_id in active_ids %}
+- `{{ capability_id }}`
+{% else %}
+- None.
+{% endfor %}
+
+Use only the active capability identifiers listed above. Provider-owned instructions remain
+in their source artifacts and are not reproduced in this managed policy.
+{% if humanizer_active %}
+
+{% include "humanizer_policy.md.j2" %}
+{% endif %}
