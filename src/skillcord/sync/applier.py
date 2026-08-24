@@ -19,11 +19,13 @@ import platform
 import secrets
 import stat
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
+from skillcord.history.store import HistoryEntry, HistoryStore, ProviderRevision
 from skillcord.sync.planner import PlannedFileChange, SyncPlan, resolve_target_within_root
 
 
@@ -47,6 +49,14 @@ class SyncRollbackError(RuntimeError):
             f"sync apply failed ({original_error}); rollback also failed: "
             + "; ".join(str(error) for error in rollback_errors)
         )
+
+
+class SyncAuditError(RuntimeError):
+    """Raised when history recording fails during the guarded sync commit."""
+
+    def __init__(self, original_error: Exception) -> None:
+        self.original_error = original_error
+        super().__init__(f"sync audit failed while committing history: {original_error}")
 
 
 @dataclass(frozen=True)
@@ -174,8 +184,23 @@ class _StagedEntry:
     content_hash: bytes
 
 
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 class SyncApplier:
     """Apply only frozen plan bytes; never discover or resolve providers."""
+
+    def __init__(
+        self,
+        history_store: HistoryStore | None = None,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        provider_revisions: Mapping[str, Mapping[str, str | None]] | None = None,
+    ) -> None:
+        self._history_store = history_store
+        self._clock = clock or _utc_now
+        self._provider_revisions = provider_revisions or {}
 
     def apply(self, plan: SyncPlan, approved: bool) -> ApplyResult:
         """Apply a plan transactionally, rolling back earlier files on failure."""
@@ -183,6 +208,9 @@ class SyncApplier:
         if not approved:
             return ApplyResult(applied=False, changed_files=())
 
+        history_entry = self._prepare_history_entry(plan)
+        if history_entry is not None and self._history_store is not None:
+            self._history_store.list()
         self._preflight(plan)
         root = plan.project_root.resolve(strict=True)
         staged: list[_StagedChange] = []
@@ -257,6 +285,11 @@ class SyncApplier:
                 applied.append(item)
                 _replace_staged(item, item.replacement, item.change.path)
                 item.replacement_consumed = True
+            if history_entry is not None and self._history_store is not None:
+                try:
+                    self._history_store.append(history_entry)
+                except Exception as error:
+                    raise SyncAuditError(error) from error
         except BaseException as error:
             rollback_errors = self._rollback(applied)
             cleanup_errors = _cleanup_staged(staged)
@@ -272,6 +305,28 @@ class SyncApplier:
             applied=True,
             changed_files=tuple(change.path for change in plan.changes),
             cleanup_errors=tuple(str(error) for error in cleanup_errors),
+        )
+
+    def _prepare_history_entry(self, plan: SyncPlan) -> HistoryEntry | None:
+        if self._history_store is None or not plan.changes:
+            return None
+        timestamp = self._clock()
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ValueError("sync audit clock must return a timezone-aware datetime")
+        rendered_timestamp = (
+            timestamp.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+        )
+        return HistoryEntry(
+            timestamp=rendered_timestamp,
+            action="sync",
+            files_changed=[change.relative_path.as_posix() for change in plan.changes],
+            provider_revisions={
+                provider_id: ProviderRevision.model_validate(dict(revision))
+                for provider_id, revision in self._provider_revisions.items()
+            },
+            deterministic_inverse=all(
+                change.ownership == "managed_block" for change in plan.changes
+            ),
         )
 
     @staticmethod
