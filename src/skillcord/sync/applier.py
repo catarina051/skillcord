@@ -25,7 +25,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
-from skillcord.history.store import HistoryEntry, HistoryStore, ProviderRevision
+from skillcord.history.store import (
+    HistoryCheckpoint,
+    HistoryEntry,
+    HistoryStore,
+    ProviderRevision,
+)
 from skillcord.sync.planner import PlannedFileChange, SyncPlan, resolve_target_within_root
 
 
@@ -57,6 +62,18 @@ class SyncAuditError(RuntimeError):
     def __init__(self, original_error: Exception) -> None:
         self.original_error = original_error
         super().__init__(f"sync audit failed while committing history: {original_error}")
+
+
+class SyncAuditCompensationError(RuntimeError):
+    """Raised when history compensation fails and synced files remain applied."""
+
+    def __init__(self, original_error: Exception, compensation_error: Exception) -> None:
+        self.original_error = original_error
+        self.compensation_error = compensation_error
+        super().__init__(
+            "sync audit failed after history commit and compensation failed; "
+            f"configuration remains applied: {original_error}; {compensation_error}"
+        )
 
 
 @dataclass(frozen=True)
@@ -209,8 +226,9 @@ class SyncApplier:
             return ApplyResult(applied=False, changed_files=())
 
         history_entry = self._prepare_history_entry(plan)
+        history_checkpoint: HistoryCheckpoint | None = None
         if history_entry is not None and self._history_store is not None:
-            self._history_store.list()
+            history_checkpoint = self._history_store.checkpoint()
         self._preflight(plan)
         root = plan.project_root.resolve(strict=True)
         staged: list[_StagedChange] = []
@@ -289,8 +307,25 @@ class SyncApplier:
                 try:
                     self._history_store.append(history_entry)
                 except Exception as error:
+                    if history_checkpoint is None:
+                        raise RuntimeError("missing sync history checkpoint") from error
+                    try:
+                        self._history_store.compensate_append(
+                            history_checkpoint,
+                            history_entry,
+                        )
+                    except Exception as compensation_error:
+                        raise SyncAuditCompensationError(
+                            error,
+                            compensation_error,
+                        ) from compensation_error
                     raise SyncAuditError(error) from error
         except BaseException as error:
+            if isinstance(error, SyncAuditCompensationError):
+                cleanup_errors = _cleanup_staged(staged)
+                cleanup_errors.extend(_close_guards(staged))
+                _add_error_notes(error, "cleanup", cleanup_errors)
+                raise
             rollback_errors = self._rollback(applied)
             cleanup_errors = _cleanup_staged(staged)
             cleanup_errors.extend(_close_guards(staged))
@@ -324,9 +359,7 @@ class SyncApplier:
                 provider_id: ProviderRevision.model_validate(dict(revision))
                 for provider_id, revision in self._provider_revisions.items()
             },
-            deterministic_inverse=all(
-                change.ownership == "managed_block" for change in plan.changes
-            ),
+            deterministic_inverse=False,
         )
 
     @staticmethod
