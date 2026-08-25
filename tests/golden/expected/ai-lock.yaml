@@ -2,66 +2,66 @@ providers:
   ecc:
     components:
     - artifacts:
-        C:/Users/catar/skillcord/tests/fixtures/providers/ecc/skills/security-review/SKILL.md:
-          path: C:\Users\catar\skillcord\tests\fixtures\providers\ecc\skills\security-review\SKILL.md
+        <fixture-providers>/ecc/skills/security-review/SKILL.md:
+          path: <fixture-providers>/ecc/skills/security-review/SKILL.md
           sha256: e1dfe6495612d71a5f0906feb4969a1154e2264f20928d127249399618e86e42
-        C:/Users/catar/skillcord/tests/fixtures/providers/ecc/skills/tdd/SKILL.md:
-          path: C:\Users\catar\skillcord\tests\fixtures\providers\ecc\skills\tdd\SKILL.md
+        <fixture-providers>/ecc/skills/tdd/SKILL.md:
+          path: <fixture-providers>/ecc/skills/tdd/SKILL.md
           sha256: 56353230fca8e9c53c4156ef736a630c2058fc17c112fe39bf5ba814fc943b2e
       component_id: ecc
-      source_path: C:\Users\catar\skillcord\tests\fixtures\providers\ecc
+      source_path: <fixture-providers>/ecc
       source_revision: null
       updater_can_mutate: false
     - artifacts:
-        C:/Users/catar/skillcord/tests/fixtures/providers/ecc/agents/security-reviewer.md:
-          path: C:\Users\catar\skillcord\tests\fixtures\providers\ecc\agents\security-reviewer.md
+        <fixture-providers>/ecc/agents/security-reviewer.md:
+          path: <fixture-providers>/ecc/agents/security-reviewer.md
           sha256: fd5909395371bb2ed21b2c7d2c9cf2d1f6dc7c0cdca738f21d6a1b358d82c8b5
       component_id: ecc.agent.security-reviewer
-      source_path: C:\Users\catar\skillcord\tests\fixtures\providers\ecc\agents\security-reviewer.md
+      source_path: <fixture-providers>/ecc/agents/security-reviewer.md
       source_revision: null
       updater_can_mutate: false
     - artifacts:
-        C:/Users/catar/skillcord/tests/fixtures/providers/ecc/commands/security-review.md:
-          path: C:\Users\catar\skillcord\tests\fixtures\providers\ecc\commands\security-review.md
+        <fixture-providers>/ecc/commands/security-review.md:
+          path: <fixture-providers>/ecc/commands/security-review.md
           sha256: 9df0e944e71848210fd44ae95385f12b5af6278cf6ca69d5d16892d77f2204a1
       component_id: ecc.command.security-review
-      source_path: C:\Users\catar\skillcord\tests\fixtures\providers\ecc\commands\security-review.md
+      source_path: <fixture-providers>/ecc/commands/security-review.md
       source_revision: null
       updater_can_mutate: false
     provider_id: ecc
   humanizer:
     components:
     - artifacts:
-        C:/Users/catar/skillcord/tests/fixtures/providers/humanizer/SKILL.md:
-          path: C:\Users\catar\skillcord\tests\fixtures\providers\humanizer\SKILL.md
+        <fixture-providers>/humanizer/SKILL.md:
+          path: <fixture-providers>/humanizer/SKILL.md
           sha256: 29985d2ce691c3df65f13dab86d6ecddfd2a79a403240f74979bdc5ce0bdcfe5
       component_id: humanizer
-      source_path: C:\Users\catar\skillcord\tests\fixtures\providers\humanizer
+      source_path: <fixture-providers>/humanizer
       source_revision: null
       updater_can_mutate: false
     provider_id: humanizer
   open_design:
     components:
     - artifacts:
-        C:/Users/catar/skillcord/tests/fixtures/providers/open_design/skills/ui_design/SKILL.md:
-          path: C:\Users\catar\skillcord\tests\fixtures\providers\open_design\skills\ui_design\SKILL.md
+        <fixture-providers>/open_design/skills/ui_design/SKILL.md:
+          path: <fixture-providers>/open_design/skills/ui_design/SKILL.md
           sha256: be30369f441ad20d0baf6071136ddbd7bfb807e9305c17743b941eb05ad67ec9
       component_id: open_design
-      source_path: C:\Users\catar\skillcord\tests\fixtures\providers\open_design
+      source_path: <fixture-providers>/open_design
       source_revision: null
       updater_can_mutate: false
     provider_id: open_design
   superpowers:
     components:
     - artifacts:
-        C:/Users/catar/skillcord/tests/fixtures/providers/superpowers/skills/brainstorming/SKILL.md:
-          path: C:\Users\catar\skillcord\tests\fixtures\providers\superpowers\skills\brainstorming\SKILL.md
+        <fixture-providers>/superpowers/skills/brainstorming/SKILL.md:
+          path: <fixture-providers>/superpowers/skills/brainstorming/SKILL.md
           sha256: 1c52dee88a69a31d065108f9f0e03fb1cb6badef700a7fd380cbb805a2f0a751
-        C:/Users/catar/skillcord/tests/fixtures/providers/superpowers/skills/test-driven-development/SKILL.md:
-          path: C:\Users\catar\skillcord\tests\fixtures\providers\superpowers\skills\test-driven-development\SKILL.md
+        <fixture-providers>/superpowers/skills/test-driven-development/SKILL.md:
+          path: <fixture-providers>/superpowers/skills/test-driven-development/SKILL.md
           sha256: aafdbe1cdd4eecff480e5fadaadff276d75d4ab981d72a9903bb98815f1c8a35
       component_id: superpowers
-      source_path: C:\Users\catar\skillcord\tests\fixtures\providers\superpowers
+      source_path: <fixture-providers>/superpowers
       source_revision: null
       updater_can_mutate: true
     provider_id: superpowers

@@ -42,6 +42,27 @@ class _NoRevisionResolver:
         del path
 
 
+def _canonicalize_lock_yaml(lock_yaml: bytes) -> bytes:
+    """Replace checkout-local fixture paths in the reviewed lock representation."""
+
+    provider_root = _PROVIDER_ROOT.resolve()
+    native_root = str(provider_root)
+    posix_root = provider_root.as_posix()
+
+    def normalize(value: object) -> object:
+        if isinstance(value, dict):
+            return {normalize(key): normalize(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        if isinstance(value, str) and value.startswith((native_root, posix_root)):
+            return value.replace(native_root, "<fixture-providers>").replace(
+                posix_root, "<fixture-providers>"
+            ).replace("\\", "/")
+        return value
+
+    return yaml.safe_dump(normalize(yaml.safe_load(lock_yaml)), sort_keys=True).encode("utf-8")
+
+
 class GoldenRunner:
     """Run the full V1 flow against a disposable project copy."""
 
@@ -120,7 +141,9 @@ class GoldenRunner:
         return GoldenOutput(
             agents_md=(project_root / "AGENTS.md").read_bytes(),
             claude_md=(project_root / "CLAUDE.md").read_bytes(),
-            lock_yaml=LockService(revision_resolver=_NoRevisionResolver()).serialize(lock),
+            lock_yaml=_canonicalize_lock_yaml(
+                LockService(revision_resolver=_NoRevisionResolver()).serialize(lock)
+            ),
             status_json=serialize_status(report).encode("utf-8"),
         )
 
@@ -140,3 +163,12 @@ def test_multi_provider_project_matches_reviewed_golden(golden_runner: GoldenRun
     assert output.claude_md == read_bytes("tests/golden/expected/CLAUDE.md")
     assert output.lock_yaml == read_bytes("tests/golden/expected/ai-lock.yaml")
     assert output.status_json == read_bytes("tests/golden/expected/status.json")
+
+
+def test_multi_provider_lock_golden_hides_checkout_path(golden_runner: GoldenRunner) -> None:
+    """A checkout relocation must not change the reviewed lock representation."""
+
+    output = golden_runner.run("tests/fixtures/projects/multi-provider")
+
+    assert str(_REPOSITORY_ROOT).encode("utf-8") not in output.lock_yaml
+    assert _REPOSITORY_ROOT.as_posix().encode("utf-8") not in output.lock_yaml
