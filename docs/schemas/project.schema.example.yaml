@@ -1,0 +1,13 @@
+# .ai/project.yaml — AI intent only; do not repeat Python, Node, or other runtime versions.
+schema_version: 1
+project:
+  intent: fullstack_web_application
+ai:
+  harnesses:
+    - claude
+    - codex
+  desired_capabilities:
+    - planning
+    - testing
+    - debugging
+    - code_review

@@ -1,0 +1,17 @@
+# .ai/ai-lock.yaml — resolved source components and applied artifact hashes.
+schema_version: 1
+skillcord_schema_version: 1
+providers:
+  superpowers:
+    provider_id: superpowers
+    components:
+      - component_id: superpowers
+        source_path: /local/providers/superpowers
+        source_revision: 0123456789abcdef0123456789abcdef01234567
+        updater_can_mutate: false
+        artifacts:
+          test-driven-development:
+            path: /local/providers/superpowers/skills/test-driven-development/SKILL.md
+            sha256: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+resolved_ids:
+  - superpowers.test-driven-development

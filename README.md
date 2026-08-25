@@ -38,10 +38,8 @@ The current runtime core includes:
 - append-only audit history for Skillcord-managed sync changes;
 - structured doctor checks and deterministic machine-readable status.
 
-The CLI orchestration, golden end-to-end fixtures, CI safety gate, and final release
-documentation remain planned work. See the
-[implementation plan](docs/superpowers/plans/2026-08-11-skillcord-runtime-v1-implementation-plan.md)
-for the full sequence.
+See [provider support](docs/providers.md), [conflict handling](docs/conflicts.md), and
+[security boundaries](docs/security.md) for the V1 contract.
 
 ## Safety model
 
@@ -108,6 +106,9 @@ sync/            diff planning and safe application
 
 ## Local development
 
+`Skillcord` is an internal codename only. The local-development CLI is
+`skillcord-dev`; it is not a public package or CLI promise.
+
 Requirements:
 
 - Python 3.11 or newer;
@@ -140,5 +141,6 @@ criteria, and task order.
 
 ## Project status
 
-This repository is a development prototype. The `Skillcord` name must be re-evaluated for
-package, repository, CLI, web, and trademark collisions before any public release.
+This repository is a development prototype. Before any public package or CLI release, use
+the [release checklist](docs/release-checklist.md), including its namespace, CLI, web, and
+trademark collision checks.
