@@ -27,7 +27,8 @@ dev = [
 skillcord-dev = "skillcord.cli.app:app"
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q --import-mode=importlib"
+pythonpath = ["."]
 testpaths = ["tests"]
 
 [tool.ruff]
@@ -38,6 +39,18 @@ line-length = 100
 python_version = "3.11"
 strict = true
 packages = ["skillcord"]
+
+[tool.coverage.report]
+fail_under = 90
+include = [
+  "src/skillcord/providers/*",
+  "src/skillcord/overlap/*",
+  "src/skillcord/decisions/*",
+  "src/skillcord/locking/*",
+  "src/skillcord/managed_blocks/*",
+  "src/skillcord/sync/*",
+  "src/skillcord/status/*",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/skillcord"]
