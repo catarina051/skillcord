@@ -2,7 +2,9 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
+from skillcord.cli import app as cli_app
 from skillcord.cli.app import app
+from skillcord.models.capability import CapabilityGroup
 
 
 def test_sync_requires_approval_before_writing(tmp_path: Path) -> None:
@@ -100,3 +102,48 @@ def test_noninteractive_sync_rejects_missing_override_reference(tmp_path: Path) 
 
     assert result.exit_code == 1
     assert "missing.skill" in result.stderr
+
+
+def test_noninteractive_sync_rejects_unresolved_single_owner_group(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    runner = CliRunner()
+    for provider in ("one", "two"):
+        root = tmp_path / provider
+        root.mkdir()
+        (root / "SKILL.md").write_text(
+            "---\nname: Security\ncapabilities: [security]\n---\n",
+            encoding="utf-8",
+        )
+    assert runner.invoke(
+        app, ["init", "--project-root", str(tmp_path), "--harness", "claude"]
+    ).exit_code == 0
+
+    def single_owner_group(skills, aliases, overrides):
+        return [
+            CapabilityGroup(
+                capability_id="security",
+                candidates=list(skills),
+                single_owner_required=True,
+            )
+        ]
+
+    monkeypatch.setattr(cli_app, "group_capabilities", single_owner_group)
+    result = runner.invoke(
+        app,
+        [
+            "sync",
+            "--project-root",
+            str(tmp_path),
+            "--non-interactive",
+            "--yes",
+            "--source",
+            f"one={tmp_path / 'one'}",
+            "--source",
+            f"two={tmp_path / 'two'}",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "capability 'security' lacks a persisted decision" in result.stderr
