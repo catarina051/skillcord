@@ -1,0 +1,6 @@
+schema_version: 1
+overrides:
+  test-driven-development:
+    prefer: superpowers.test-driven-development
+    suppress:
+      - ecc.tdd

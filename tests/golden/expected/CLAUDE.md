@@ -1,0 +1,5 @@
+<!-- skillcord:begin -->
+## Claude Code adapter
+
+Read and follow the universal managed AI capability policy in `AGENTS.md`.
+<!-- skillcord:end -->

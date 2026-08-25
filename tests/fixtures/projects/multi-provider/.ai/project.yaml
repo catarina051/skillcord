@@ -1,0 +1,11 @@
+schema_version: 1
+project:
+  intent: Deterministic four-provider AI runtime fixture
+ai:
+  harnesses:
+    - claude
+  desired_capabilities:
+    - testing
+    - security-review
+    - ui-design
+    - prose-refinement

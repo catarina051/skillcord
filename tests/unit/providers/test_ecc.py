@@ -9,7 +9,10 @@ from skillcord.providers.ecc import ECCAdapter
 def test_ecc_discovers_declarative_skills_and_reports_hooks() -> None:
     snapshot = ECCAdapter().discover(Path("tests/fixtures/providers/ecc"))
 
-    assert {skill.normalized_id for skill in snapshot.skills} == {"ecc.security-review"}
+    assert {skill.normalized_id for skill in snapshot.skills} == {
+        "ecc.security-review",
+        "ecc.tdd",
+    }
     assert snapshot.partial_support is True
     assert snapshot.unsupported_assets[0].kind == "executable-hook"
     assert snapshot.unsupported_assets[0].source_path == (
@@ -37,7 +40,10 @@ def test_ecc_discovery_does_not_execute_subprocesses(monkeypatch) -> None:
 
     snapshot = ECCAdapter().discover(Path("tests/fixtures/providers/ecc"))
 
-    assert [skill.normalized_id for skill in snapshot.skills] == ["ecc.security-review"]
+    assert [skill.normalized_id for skill in snapshot.skills] == [
+        "ecc.security-review",
+        "ecc.tdd",
+    ]
 
 
 def test_ecc_discovers_declarative_skills_at_supported_nested_paths(tmp_path: Path) -> None:
