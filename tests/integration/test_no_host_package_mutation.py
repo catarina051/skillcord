@@ -42,8 +42,15 @@ def test_discovery_sync_planning_and_doctor_never_execute_processes(
 
     discovered = DiscoveryService.default().scan(
         tmp_path,
-        {"superpowers": _REPOSITORY_ROOT / "tests" / "fixtures" / "providers" / "superpowers"},
+        {
+            "superpowers": _REPOSITORY_ROOT / "tests" / "fixtures" / "providers" / "superpowers",
+            "ecc": _REPOSITORY_ROOT / "tests" / "fixtures" / "providers" / "ecc",
+        },
     )
+    ecc = next(provider for provider in discovered.providers if provider.provider_id == "ecc")
+    assert [(asset.kind, asset.reason) for asset in ecc.unsupported_assets] == [
+        ("executable-hook", "ECC executable hooks are unsupported and remain inactive in V1")
+    ]
     project = ProjectConfig(
         schema_version=1,
         project=ProjectInfo(intent="safety test"),
