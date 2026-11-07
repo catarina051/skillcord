@@ -1,5 +1,12 @@
 # Skillcord
 
+> **Status: prototype.** The runtime core (provider discovery, normalization, overlap detection,
+> decisions, locking, managed blocks and sync planning) is implemented and tested. On the
+> `feat/runtime-v1` branch, measured on 2026-11-07: 273 tests pass (7 skipped), coverage is 92%, and
+> `ruff check` and `mypy` report no issues. The local development CLI (`skillcord-dev`) exists only on
+> that branch and is not released: there is no published package and no public CLI.
+> Commit history on that branch before this notice: 43 commits across 3 days (11, 24 and 25 August 2026).
+
 > Internal codename for a local-first AI development runtime prototype.
 
 Skillcord explores how teams can make AI coding-agent capabilities reproducible across
