@@ -1,5 +1,9 @@
 # Skillcord
 
+> **Status: paused prototype (last change on 2026-08-24).** The runtime core below is implemented
+> and has unit and integration tests; the CLI, end-to-end fixtures, and CI safety gate were never
+> finished. It is not a usable tool yet, and it stays public as a record of the design.
+
 > Internal codename for a local-first AI development runtime prototype.
 
 Skillcord explores how teams can make AI coding-agent capabilities reproducible across
@@ -7,7 +11,7 @@ projects and harnesses. It discovers locally available providers, normalizes the
 metadata, identifies deterministic capability overlap, records explicit human decisions,
 pins resolved content, and generates safe project-level configuration.
 
-The V1 runtime is under active development. It is not a published package or a reserved
+Development of the V1 runtime is paused. It is not a published package or a reserved
 public CLI brand.
 
 ## Why this project exists
